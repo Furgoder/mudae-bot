@@ -121,6 +121,56 @@ PROFILE_STATE = {
 # Не кликать какеру до этого unix-timestamp (после отказа Mudae)
 KAKERA_COOLDOWN_UNTIL = 0.0
 
+# $rolls можно тратить только один раз за интервал сброса роллов
+ROLLS_RESET_USED_UNTIL = 0.0
+_DEFAULT_ROLLS_INTERVAL_MINUTES = 60
+_ROLLS_INTERVAL_BLOCK_RE = re.compile(
+    r"one rolls reset per interval",
+    re.IGNORECASE,
+)
+_ROLLS_INTERVAL_TIME_RE = re.compile(
+    r"time left:\s*(?:(\d+)\s*h\s*)?(\d+)\s*min",
+    re.IGNORECASE,
+)
+
+
+def rolls_reset_on_cooldown():
+    return time.time() < ROLLS_RESET_USED_UNTIL
+
+
+def rolls_reset_cooldown_left_seconds():
+    return max(0, int(ROLLS_RESET_USED_UNTIL - time.time()))
+
+
+def _set_rolls_reset_cooldown(minutes, *, reason=''):
+    """Блокирует повторный $rolls до конца текущего интервала."""
+    global ROLLS_RESET_USED_UNTIL
+    minutes = max(1, int(minutes or 0))
+    ROLLS_RESET_USED_UNTIL = time.time() + minutes * 60
+    suffix = f" ({reason})" if reason else ''
+    log_msg(
+        'ROLL',
+        f"$rolls уже использован в этом интервале{suffix}. "
+        f"Следующий через {minutes} мин "
+        f"(до {time.strftime('%H:%M:%S', time.localtime(ROLLS_RESET_USED_UNTIL))}).",
+    )
+
+
+def _parse_rolls_interval_minutes(text):
+    match = _ROLLS_INTERVAL_TIME_RE.search(text or '')
+    if not match:
+        return _DEFAULT_ROLLS_INTERVAL_MINUTES
+    return int(match.group(1) or 0) * 60 + int(match.group(2) or 0)
+
+
+def _parse_rolls_interval_block(text):
+    """«One rolls reset per interval. Time left: 5 min.»"""
+    if not _ROLLS_INTERVAL_BLOCK_RE.search(text or ''):
+        return None
+    minutes = _parse_rolls_interval_minutes(text)
+    _set_rolls_reset_cooldown(minutes, reason='ответ Mudae')
+    return {'type': 'rolls_interval', 'minutes': minutes}
+
 # Дедуп логов DROP и начислений по message id
 _processed_message_ids = {}
 
@@ -368,6 +418,11 @@ def handle_mudae_chat(content, message_id=None):
         )
         try_use_dk_for_kakera_cd()
         return {'type': 'kakera_cooldown', 'minutes': minutes}
+
+    if _ROLLS_INTERVAL_BLOCK_RE.search(parsed):
+        if not _once('rolls_interval'):
+            return None
+        return _parse_rolls_interval_block(parsed)
 
     # Явный маркер ($ku) без стандартной фразы — всё равно ставим КД
     if '$ku' in lower and 'kakera' in lower:
@@ -929,9 +984,25 @@ def _rolls_worth_spinning(profile_state):
 
 
 def _try_use_rolls(profile_state, *, context=''):
-    """Отправляет $rolls, если есть сбросы в запасе и есть смысл крутить дальше."""
+    """Отправляет $rolls один раз за интервал, если есть сбросы и смысл крутить."""
+    if not getattr(Vars, 'rollsEnabled', True):
+        suffix = f" ({context})" if context else ''
+        log_msg('ROLL', f"$rolls выключен в Vars.rollsEnabled{suffix}.", dim=True)
+        return False
+
     rolls_resets = int(profile_state.get('rolls_resets', 0) or 0)
     if rolls_resets <= 0:
+        return False
+
+    if rolls_reset_on_cooldown():
+        left_min = max(1, (rolls_reset_cooldown_left_seconds() + 59) // 60)
+        suffix = f" ({context})" if context else ''
+        log_msg(
+            'ROLL',
+            f"$rolls пропущен{suffix}: уже использован в этом интервале "
+            f"(ещё {left_min} мин).",
+            dim=True,
+        )
         return False
 
     if not _rolls_worth_spinning(profile_state):
@@ -948,8 +1019,23 @@ def _try_use_rolls(profile_state, *, context=''):
 
     suffix = f" — {context}" if context else ''
     log_msg('ROLL', f"Использую $rolls{suffix}.")
+    last_message_id = _get_latest_message_id()
     if _send_text_command('$rolls') not in [200, 204]:
         return False
+
+    mudae_message = _wait_for_mudae_reply(last_message_id)
+    if mudae_message:
+        handle_mudae_chat(
+            mudae_message.get('content', ''),
+            message_id=mudae_message.get('id'),
+        )
+        if rolls_reset_on_cooldown():
+            return False
+
+    reset_in = int(profile_state.get('rolls_reset_minutes', 0) or 0)
+    if reset_in <= 0:
+        reset_in = _DEFAULT_ROLLS_INTERVAL_MINUTES
+    _set_rolls_reset_cooldown(reset_in, reason='успешный сброс')
 
     profile_state['rolls_reset_used'] = True
     profile_state['rolls_resets'] = rolls_resets - 1

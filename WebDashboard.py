@@ -30,7 +30,7 @@ VAR_SECTIONS = [
     ('Миниигры', ['ouroMinigamesEnabled']),
     ('Роллы и клейм', [
         'rollCommand', 'desiredKakeras', 'desiredSeries', 'min_power_threshold',
-        'pokeRoll', 'repeatMinute', 'max_rolls_per_session', 'kakera_max_clicks',
+        'pokeRoll', 'rollsEnabled', 'repeatMinute', 'max_rolls_per_session', 'kakera_max_clicks',
         'claim_ttl',
     ]),
     ('Жадность порога', [

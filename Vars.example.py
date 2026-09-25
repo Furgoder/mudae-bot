@@ -26,6 +26,8 @@ desiredKakeras = ['kakeraP', 'kakeraY', 'kakeraO', 'kakeraR', 'kakeraW', 'kakera
 desiredSeries = []
 min_power_threshold = 80
 pokeRoll = False
+# True — тратить $rolls (один раз за интервал). False — не отправлять $rolls.
+rollsEnabled = True
 repeatMinute = '38'
 max_rolls_per_session = 150
 kakera_max_clicks = 8
