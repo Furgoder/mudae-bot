@@ -1,0 +1,1054 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mudae Bot Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Syne:wght@600;700;800&display=swap" rel="stylesheet" />
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            display: ['Syne', 'sans-serif'],
+            mono: ['IBM Plex Mono', 'monospace'],
+          },
+          colors: {
+            ink: {
+              950: '#0a0c10',
+              900: '#10141c',
+              800: '#171d28',
+              700: '#222b3a',
+            },
+            accent: {
+              mint: '#3dffa8',
+              amber: '#ffb347',
+              rose: '#ff6b8a',
+              sky: '#5ec8ff',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    body {
+      background:
+        radial-gradient(ellipse 80% 50% at 20% -10%, rgba(61, 255, 168, 0.08), transparent),
+        radial-gradient(ellipse 60% 40% at 90% 0%, rgba(94, 200, 255, 0.06), transparent),
+        #0a0c10;
+    }
+    #log-list::-webkit-scrollbar { width: 10px; }
+    #log-list::-webkit-scrollbar-track { background: rgba(255,255,255,0.03); border-radius: 5px; }
+    #log-list::-webkit-scrollbar-thumb {
+      background: #3a465c;
+      border-radius: 5px;
+      border: 2px solid transparent;
+      background-clip: padding-box;
+    }
+    #log-list::-webkit-scrollbar-thumb:hover { background: #5a6a84; background-clip: padding-box; }
+    .tag-SYS { color: #5ec8ff; }
+    .tag-ROLL { color: #7dd3fc; }
+    .tag-DROP { color: #3dffa8; }
+    .tag-CLAIM { color: #86efac; }
+    .tag-KAKER { color: #ffb347; }
+    .tag-WARN { color: #ff6b8a; }
+    .fade-in { animation: fadeIn 0.25s ease-out; }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .progress-track {
+      background: rgba(255, 255, 255, 0.06);
+      height: 4px;
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #3dffa8, #5ec8ff);
+      transition: width 0.2s linear;
+    }
+    /* Цифры метрик — моноширинный шрифт: «0» не выглядит как пустой кружок (Syne) */
+    .stat-num {
+      font-family: 'IBM Plex Mono', ui-monospace, monospace;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -0.02em;
+    }
+    .tab-btn {
+      transition: color 0.15s, border-color 0.15s, background 0.15s;
+      cursor: pointer;
+    }
+    .tab-btn:hover:not(.active) {
+      color: #e2e8f0;
+      border-color: rgba(255, 255, 255, 0.22);
+      background: rgba(255, 255, 255, 0.04);
+    }
+    .tab-btn.active {
+      color: #fff;
+      border-color: rgba(61, 255, 168, 0.45);
+      background: rgba(61, 255, 168, 0.08);
+    }
+    .log-filter-btn {
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 0.5rem;
+      padding: 0.2rem 0.55rem;
+      font-size: 0.7rem;
+      color: #94a3b8;
+      background: transparent;
+      cursor: pointer;
+      transition: 0.15s;
+    }
+    .log-filter-btn:hover { border-color: rgba(255,255,255,0.25); color: #e2e8f0; }
+    .log-filter-btn.active {
+      border-color: rgba(61, 255, 168, 0.4);
+      color: #3dffa8;
+      background: rgba(61, 255, 168, 0.08);
+    }
+    .log-row-hidden { display: none !important; }
+    .toggle {
+      position: relative;
+      width: 48px;
+      height: 26px;
+      flex-shrink: 0;
+    }
+    .toggle input { opacity: 0; width: 0; height: 0; }
+    .toggle .slider {
+      position: absolute;
+      inset: 0;
+      cursor: pointer;
+      background: #222b3a;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.08);
+      transition: 0.2s;
+    }
+    .toggle .slider::before {
+      content: '';
+      position: absolute;
+      height: 18px;
+      width: 18px;
+      left: 3px;
+      bottom: 3px;
+      background: #94a3b8;
+      border-radius: 50%;
+      transition: 0.2s;
+    }
+    .toggle input:checked + .slider {
+      background: rgba(61, 255, 168, 0.25);
+      border-color: rgba(61, 255, 168, 0.5);
+    }
+    .toggle input:checked + .slider::before {
+      transform: translateX(22px);
+      background: #3dffa8;
+    }
+    .panel-hidden { display: none; }
+    .util-ready { color: #3dffa8; }
+    .util-cd { color: #ffb347; }
+  </style>
+</head>
+<body class="text-slate-200 min-h-screen font-mono">
+  <div class="w-full px-4 sm:px-6 py-6">
+    <div class="max-w-7xl mx-auto grid grid-cols-1 gap-5">
+
+    <header class="rounded-2xl border border-white/5 bg-ink-900/80 backdrop-blur px-6 py-5">
+      <div class="flex flex-wrap items-end justify-between gap-4 mb-5">
+        <div>
+          <p class="text-[11px] uppercase tracking-[0.25em] text-slate-500 mb-1">Local Monitor</p>
+          <h1 class="font-display text-3xl font-extrabold tracking-tight text-white">Mudae Dashboard</h1>
+        </div>
+        <div class="flex flex-wrap items-center gap-3">
+          <button id="btn-refresh-tu" type="button"
+            class="rounded-lg border border-white/10 bg-ink-800 hover:bg-ink-700 px-3 py-2 text-xs text-slate-200 transition">
+            🔄 Обновить данные
+          </button>
+          <div class="flex flex-col items-end gap-0.5 text-xs text-slate-500">
+            <div class="flex items-center gap-2">
+              <span class="inline-block w-2 h-2 rounded-full bg-slate-600" id="conn-dot"></span>
+              <span id="conn-label">connecting…</span>
+            </div>
+            <span id="last-update" class="text-[10px] text-slate-600">данные: —</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-5">
+        <div class="rounded-xl bg-ink-800/80 px-4 py-3 border border-white/5" title="Время работы бота с последнего запуска">
+          <p class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Аптайм</p>
+          <p id="stat-uptime" class="stat-num text-2xl font-bold text-accent-sky">00:00:00</p>
+        </div>
+        <div class="rounded-xl bg-ink-800/80 px-4 py-3 border border-white/5" title="Сумма kakera, полученная ботом за сессию (и накопленная в счётчике)">
+          <p class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Какера</p>
+          <p id="stat-kakera" class="stat-num text-2xl font-bold text-accent-amber">0</p>
+        </div>
+        <div class="rounded-xl bg-ink-800/80 px-4 py-3 border border-white/5" title="Ourospheres с миниигр / свадеб">
+          <p class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Ourospheres</p>
+          <p id="stat-ouros" class="stat-num text-2xl font-bold text-accent-sky">0</p>
+        </div>
+        <div class="rounded-xl bg-ink-800/80 px-4 py-3 border border-white/5 cursor-pointer hover:border-accent-mint/30 transition" id="stat-claims-card" title="Успешные свадьбы. Нажмите — история">
+          <p class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Успешных клеймов</p>
+          <p id="stat-claims" class="stat-num text-2xl font-bold text-accent-mint">0</p>
+          <p class="text-[10px] text-slate-600 mt-1">нажмите · история</p>
+        </div>
+        <div class="rounded-xl bg-ink-800/80 px-4 py-3 border border-white/5" title="Карты, которые бот целил, но не успел / упустил">
+          <p class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Упущено / украдено</p>
+          <p id="stat-stolen" class="stat-num text-2xl font-bold text-accent-rose">0</p>
+        </div>
+      </div>
+
+      <nav class="flex gap-2">
+        <button type="button" data-tab="dashboard" class="tab-btn active rounded-lg border border-white/10 px-4 py-2 text-sm text-slate-400">
+          Дашборд
+        </button>
+        <button type="button" data-tab="settings" class="tab-btn rounded-lg border border-white/10 px-4 py-2 text-sm text-slate-400">
+          Настройки и Управление
+        </button>
+      </nav>
+    </header>
+
+    <!-- TAB: Dashboard -->
+    <div id="tab-dashboard" class="space-y-5">
+
+      <section class="rounded-2xl border border-white/5 bg-ink-900/80 backdrop-blur px-6 py-5">
+        <div class="flex flex-wrap items-baseline justify-between gap-2 mb-4">
+          <h2 class="font-display text-lg font-bold text-white">Состояние профиля</h2>
+          <p id="claim-threshold" class="text-sm text-slate-400">
+            Клеймим при цене персонажа ≥ <span class="text-accent-mint font-semibold">—</span>
+          </p>
+        </div>
+
+        <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3 mb-4">
+          <div class="rounded-xl bg-ink-800/80 px-4 py-3 border border-white/5">
+            <p class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Кулдаун роллов</p>
+            <p id="cd-rolls" class="font-display text-xl font-bold text-accent-sky tabular-nums">—</p>
+            <p id="cd-rolls-left" class="text-[11px] text-slate-500 mt-1">роллов: —</p>
+          </div>
+          <div class="rounded-xl bg-ink-800/80 px-4 py-3 border border-white/5">
+            <p class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Кулдаун клейма</p>
+            <p id="cd-claim" class="font-display text-xl font-bold text-accent-mint tabular-nums">—</p>
+            <p id="cd-claim-flag" class="text-[11px] text-slate-500 mt-1">статус: —</p>
+          </div>
+          <div class="rounded-xl bg-ink-800/80 px-4 py-3 border border-white/5 sm:col-span-2 lg:col-span-1">
+            <p class="text-[10px] uppercase tracking-wider text-slate-500 mb-2">Утилиты</p>
+            <div class="space-y-2 text-sm">
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-slate-400">$rt</span>
+                <span id="util-rt" class="font-semibold util-cd">—</span>
+              </div>
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-slate-400">$daily</span>
+                <span id="util-daily" class="font-semibold util-cd">—</span>
+              </div>
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-slate-400">$dk</span>
+                <span id="util-dk" class="font-semibold util-cd">—</span>
+              </div>
+            </div>
+          </div>
+          <div class="rounded-xl bg-ink-800/80 px-4 py-3 border border-white/5" title="Ближайший автоматический прокрут (с джиттером)">
+            <p class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Следующий прокрут</p>
+            <p id="cd-next-roll" class="font-display text-xl font-bold text-accent-sky tabular-nums">—</p>
+            <p id="cd-next-roll-at" class="text-[11px] text-slate-500 mt-1">расписание: —</p>
+          </div>
+          <div class="rounded-xl bg-ink-800/80 px-4 py-3 border border-white/5" title="Последняя случайная пауза humanize">
+            <p class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Последний sleep</p>
+            <p id="stat-last-sleep" class="font-display text-xl font-bold text-accent-mint tabular-nums">—</p>
+            <p id="stat-last-sleep-kind" class="text-[11px] text-slate-500 mt-1">тип: —</p>
+          </div>
+          <div class="rounded-xl bg-ink-800/80 px-4 py-3 border border-white/5">
+            <p class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">$oh · Ouroharvest</p>
+            <p id="cd-oh" class="font-display text-xl font-bold text-accent-amber tabular-nums">Готово</p>
+          </div>
+          <div class="rounded-xl bg-ink-800/80 px-4 py-3 border border-white/5">
+            <p class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">$oc · Ourochest</p>
+            <p id="cd-oc" class="font-display text-xl font-bold text-accent-amber tabular-nums">Готово</p>
+          </div>
+          <div class="rounded-xl bg-ink-800/80 px-4 py-3 border border-white/5">
+            <p class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">$oq · Ouroquest</p>
+            <p id="cd-oq" class="font-display text-xl font-bold text-accent-amber tabular-nums">Готово</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="rounded-2xl border border-white/5 bg-ink-900/80 backdrop-blur px-6 py-5">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="font-display text-lg font-bold text-white">Активный буфер</h2>
+          <span id="buffer-ttl-label" class="text-[10px] uppercase tracking-wider text-slate-500">TTL 90 сек</span>
+        </div>
+        <div id="buffer-list" class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3 min-h-[72px]">
+          <p id="buffer-empty" class="col-span-full text-sm text-slate-600 py-4 text-center">
+            Буфер пуст — ждём свободную карту с ценой ≥ порога
+          </p>
+        </div>
+      </section>
+
+      <section class="rounded-2xl border border-white/5 bg-ink-900/80 backdrop-blur px-6 py-5">
+        <div class="flex flex-wrap items-center justify-between gap-3 mb-3">
+          <h2 class="font-display text-lg font-bold text-white">Лог событий</h2>
+          <div class="flex flex-wrap items-center gap-2">
+            <input id="log-search" type="search" placeholder="Поиск…"
+              class="rounded-lg border border-white/10 bg-ink-800 px-3 py-1.5 text-xs text-slate-200 w-36 sm:w-48 focus:outline-none focus:border-accent-mint/40" />
+            <button type="button" id="btn-export-log" class="log-filter-btn" title="Скачать видимый лог">Экспорт</button>
+          </div>
+        </div>
+        <div id="log-filters" class="flex flex-wrap gap-1.5 mb-3">
+          <button type="button" class="log-filter-btn active" data-log-filter="ALL">Все</button>
+          <button type="button" class="log-filter-btn" data-log-filter="ROLL">ROLL</button>
+          <button type="button" class="log-filter-btn" data-log-filter="DROP">DROP</button>
+          <button type="button" class="log-filter-btn" data-log-filter="CLAIM">CLAIM</button>
+          <button type="button" class="log-filter-btn" data-log-filter="KAKER">KAKER</button>
+          <button type="button" class="log-filter-btn" data-log-filter="SYS">SYS</button>
+          <button type="button" class="log-filter-btn" data-log-filter="WARN">WARN</button>
+        </div>
+        <div id="log-list" class="h-[28rem] overflow-y-auto space-y-1 pr-2 text-sm"></div>
+      </section>
+    </div>
+
+    <!-- Модалка истории клеймов -->
+    <div id="claims-modal" class="fixed inset-0 z-50 hidden items-center justify-center bg-black/70 p-4">
+      <div class="w-full max-w-lg rounded-2xl border border-white/10 bg-ink-900 shadow-2xl max-h-[80vh] flex flex-col">
+        <div class="flex items-center justify-between px-5 py-4 border-b border-white/5">
+          <h3 class="font-display text-lg font-bold text-white">История клеймов</h3>
+          <div class="flex items-center gap-2">
+            <button type="button" id="claims-history-clear"
+              class="text-xs px-3 py-1.5 rounded-lg border border-accent-rose/30 bg-accent-rose/10 text-accent-rose hover:bg-accent-rose/20 transition">
+              Очистить
+            </button>
+            <button type="button" id="claims-modal-close" class="text-slate-400 hover:text-white text-sm px-2 py-1">Закрыть</button>
+          </div>
+        </div>
+        <div id="claims-history-list" class="overflow-y-auto px-5 py-4 space-y-2 text-sm flex-1">
+          <p class="text-slate-600 text-center py-6">Пока пусто — успешные клеймы появятся здесь</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB: Settings -->
+    <div id="tab-settings" class="panel-hidden space-y-5">
+      <section class="rounded-2xl border border-white/5 bg-ink-900/80 backdrop-blur px-6 py-5">
+        <div class="flex flex-wrap items-start justify-between gap-3 mb-2">
+          <div>
+            <h2 class="font-display text-lg font-bold text-white mb-1">Динамический конфиг · Vars.py</h2>
+            <p class="text-xs text-slate-500">Все переменные. «Сохранить» перезапишет файл и перезапустит бота.</p>
+          </div>
+          <button id="btn-save-vars" type="button"
+            class="rounded-xl border border-accent-mint/40 bg-accent-mint/10 hover:bg-accent-mint/20 px-5 py-2.5 text-sm font-semibold text-accent-mint transition">
+            Сохранить и перезапустить
+          </button>
+        </div>
+        <form id="vars-form" class="space-y-6 mt-5"></form>
+        <p id="vars-hint" class="text-xs text-slate-600 mt-4 min-h-[1rem]"></p>
+      </section>
+
+      <section class="rounded-2xl border border-white/5 bg-ink-900/80 backdrop-blur px-6 py-5">
+        <h2 class="font-display text-lg font-bold text-white mb-1">Экстренное управление</h2>
+        <p class="text-xs text-slate-500 mb-5">Команды выполняются в отдельных потоках и не блокируют UI</p>
+        <div class="flex flex-wrap gap-3">
+          <button id="btn-force-roll" type="button"
+            class="rounded-xl border border-accent-sky/30 bg-accent-sky/10 hover:bg-accent-sky/20 px-5 py-3 text-sm font-semibold text-accent-sky transition">
+            Принудительный Прокрут
+          </button>
+          <button id="btn-force-minigames" type="button"
+            class="rounded-xl border border-accent-amber/30 bg-accent-amber/10 hover:bg-accent-amber/20 px-5 py-3 text-sm font-semibold text-accent-amber transition">
+            Запуск Миниигр
+          </button>
+          <button id="btn-restart" type="button"
+            class="rounded-xl border border-accent-rose/30 bg-accent-rose/10 hover:bg-accent-rose/20 px-5 py-3 text-sm font-semibold text-accent-rose transition">
+            Перезапустить Бота
+          </button>
+        </div>
+        <p id="action-hint" class="text-xs text-slate-600 mt-4 min-h-[1rem]"></p>
+      </section>
+    </div>
+
+    </div>
+  </div>
+
+  <script>
+    let claimTtlSec = 90;
+    let bufferTtlMs = claimTtlSec * 1000;
+    const bufferCards = new Map();
+    let minigameReadyAt = { oh: null, oc: null, oq: null };
+    let nextRollAt = null;
+    let rollingNow = false;
+    let lastUptime = 0;
+    let lastUptimeAt = Date.now();
+    let varsMeta = { values: {}, types: {}, sections: [], secrets: [] };
+
+    const el = {
+      uptime: document.getElementById('stat-uptime'),
+      kakera: document.getElementById('stat-kakera'),
+      ouros: document.getElementById('stat-ouros'),
+      claims: document.getElementById('stat-claims'),
+      stolen: document.getElementById('stat-stolen'),
+      buffer: document.getElementById('buffer-list'),
+      bufferEmpty: document.getElementById('buffer-empty'),
+      bufferTtlLabel: document.getElementById('buffer-ttl-label'),
+      log: document.getElementById('log-list'),
+      connDot: document.getElementById('conn-dot'),
+      connLabel: document.getElementById('conn-label'),
+      cdRolls: document.getElementById('cd-rolls'),
+      cdRollsLeft: document.getElementById('cd-rolls-left'),
+      cdClaim: document.getElementById('cd-claim'),
+      cdClaimFlag: document.getElementById('cd-claim-flag'),
+      utilRt: document.getElementById('util-rt'),
+      utilDaily: document.getElementById('util-daily'),
+      utilDk: document.getElementById('util-dk'),
+      claimThreshold: document.getElementById('claim-threshold'),
+      cdOh: document.getElementById('cd-oh'),
+      cdOc: document.getElementById('cd-oc'),
+      cdOq: document.getElementById('cd-oq'),
+      cdNextRoll: document.getElementById('cd-next-roll'),
+      cdNextRollAt: document.getElementById('cd-next-roll-at'),
+      lastSleep: document.getElementById('stat-last-sleep'),
+      lastSleepKind: document.getElementById('stat-last-sleep-kind'),
+      actionHint: document.getElementById('action-hint'),
+      varsForm: document.getElementById('vars-form'),
+      varsHint: document.getElementById('vars-hint'),
+      claimsModal: document.getElementById('claims-modal'),
+      claimsHistoryList: document.getElementById('claims-history-list'),
+      claimsCard: document.getElementById('stat-claims-card'),
+      lastUpdate: document.getElementById('last-update'),
+      logSearch: document.getElementById('log-search'),
+    };
+
+    let claimHistory = [];
+    let logFilterTag = 'ALL';
+    let logSearchQuery = '';
+    let currentThresholdLabel = '—';
+
+    function escapeHtml(str) {
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function formatUptime(seconds) {
+      const s = Math.max(0, Math.floor(seconds));
+      const h = String(Math.floor(s / 3600)).padStart(2, '0');
+      const m = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+      const sec = String(s % 60).padStart(2, '0');
+      return `${h}:${m}:${sec}`;
+    }
+
+    function formatMinutes(mins) {
+      mins = Math.max(0, Math.floor(Number(mins) || 0));
+      if (mins <= 0) return 'Готово';
+      const h = Math.floor(mins / 60);
+      const m = mins % 60;
+      if (h > 0) return `${h}ч ${m}м`;
+      return `${m} мин`;
+    }
+
+    function formatUtilStatus(ready, minutesLeft) {
+      if (ready === true) {
+        return { text: '[Готов]', cls: 'util-ready' };
+      }
+      if (ready === false) {
+        const mins = Math.max(0, Math.floor(Number(minutesLeft) || 0));
+        if (mins <= 0) {
+          return { text: '[КД]', cls: 'util-cd' };
+        }
+        const h = Math.floor(mins / 60);
+        const m = mins % 60;
+        const body = h > 0 ? `${h} ч ${m} мин` : `${m} мин`;
+        return { text: `[КД: ${body}]`, cls: 'util-cd' };
+      }
+      // null/undefined — статус не распарсили
+      return { text: '[—]', cls: 'text-slate-500' };
+    }
+
+    function setUtil(node, ready, minutesLeft) {
+      const st = formatUtilStatus(ready, minutesLeft);
+      node.textContent = st.text;
+      node.className = `font-semibold ${st.cls}`;
+    }
+
+    function formatSecondsLeft(sec) {
+      sec = Math.max(0, Math.floor(sec));
+      if (sec <= 0) return 'Готово';
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const s = sec % 60;
+      if (h > 0) return `${h}ч ${m}м`;
+      if (m > 0) return `${m}м ${String(s).padStart(2, '0')}с`;
+      return `${s}с`;
+    }
+
+    function applyConfig(data) {
+      if (!data) return;
+      if (data.claim_ttl != null) {
+        claimTtlSec = Math.max(1, Number(data.claim_ttl) || 90);
+        bufferTtlMs = claimTtlSec * 1000;
+        el.bufferTtlLabel.textContent = `TTL ${claimTtlSec} сек`;
+      }
+    }
+
+    function applyStats(data) {
+      if (!data) return;
+      if (typeof data.uptime === 'number') el.uptime.textContent = formatUptime(data.uptime);
+      if (data.kakera_earned != null) el.kakera.textContent = Number(data.kakera_earned).toLocaleString('ru-RU');
+      if (data.ourospheres_earned != null && el.ouros) {
+        el.ouros.textContent = Number(data.ourospheres_earned).toLocaleString('ru-RU');
+      }
+      if (data.successful_claims != null) el.claims.textContent = data.successful_claims;
+      if (data.stolen_or_missed != null) el.stolen.textContent = data.stolen_or_missed;
+
+      if (data.next_roll_at != null) {
+        nextRollAt = Number(data.next_roll_at);
+      } else if (Object.prototype.hasOwnProperty.call(data, 'next_roll_at')) {
+        nextRollAt = null;
+      }
+      if (typeof data.rolling === 'boolean') rollingNow = data.rolling;
+
+      if (data.last_sleep_sec != null && el.lastSleep) {
+        el.lastSleep.textContent = `${Number(data.last_sleep_sec).toFixed(2)}с`;
+      }
+      if (el.lastSleepKind) {
+        const label = data.last_sleep_label || data.last_sleep_kind;
+        el.lastSleepKind.textContent = label ? `тип: ${label}` : 'тип: —';
+      }
+      tickNextRoll();
+    }
+
+    function formatClock(ts) {
+      const d = new Date(Number(ts) * 1000);
+      if (Number.isNaN(d.getTime())) return '—';
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    }
+
+    function tickNextRoll() {
+      if (!el.cdNextRoll) return;
+      if (rollingNow) {
+        el.cdNextRoll.textContent = 'Идёт сессия…';
+        if (el.cdNextRollAt) {
+          const future = nextRollAt != null && nextRollAt > Date.now() / 1000;
+          el.cdNextRollAt.textContent = future
+            ? `далее: ${formatClock(nextRollAt)}`
+            : 'прокруты сейчас';
+        }
+        return;
+      }
+      if (nextRollAt == null) {
+        el.cdNextRoll.textContent = '—';
+        if (el.cdNextRollAt) el.cdNextRollAt.textContent = 'расписание: —';
+        return;
+      }
+      const left = nextRollAt - Date.now() / 1000;
+      el.cdNextRoll.textContent = formatSecondsLeft(left);
+      if (el.cdNextRollAt) el.cdNextRollAt.textContent = `в ${formatClock(nextRollAt)}`;
+    }
+
+    function markDataUpdated(ts) {
+      if (!el.lastUpdate) return;
+      const d = ts ? new Date(ts * 1000) : new Date();
+      if (Number.isNaN(d.getTime())) return;
+      const pad = (n) => String(n).padStart(2, '0');
+      el.lastUpdate.textContent =
+        `данные: ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    }
+
+    function updateBufferEmptyText() {
+      if (!el.bufferEmpty) return;
+      el.bufferEmpty.textContent =
+        `Буфер пуст — ждём свободную карту с ценой ≥ ${currentThresholdLabel}`;
+    }
+
+    function applyProfile(data) {
+      if (!data) return;
+      el.cdRolls.textContent = formatMinutes(data.rolls_reset_minutes);
+      el.cdRollsLeft.textContent = `роллов: ${data.rolls_left ?? '—'} · сбросов: ${data.rolls_resets ?? '—'}`;
+      el.cdClaim.textContent = formatMinutes(data.claim_minutes_left);
+      el.cdClaimFlag.textContent = data.can_claim ? 'статус: доступен' : 'статус: в откате';
+
+      setUtil(el.utilRt, data.rt_ready, data.rt_minutes_left);
+      setUtil(el.utilDaily, data.daily_ready, data.daily_minutes_left);
+      setUtil(el.utilDk, data.dk_ready, data.dk_minutes_left);
+
+      const thr = data.current_threshold;
+      currentThresholdLabel =
+        thr != null && thr !== ''
+          ? Number(thr).toLocaleString('ru-RU', { maximumFractionDigits: 1 })
+          : '—';
+      el.claimThreshold.innerHTML =
+        `Клеймим при цене персонажа ≥ <span class="text-accent-mint font-semibold">${escapeHtml(currentThresholdLabel)}</span>`;
+      updateBufferEmptyText();
+
+      if (data.claim_ttl != null) {
+        applyConfig({ claim_ttl: data.claim_ttl });
+      }
+      if (data.updated_at != null) markDataUpdated(data.updated_at);
+      else markDataUpdated();
+    }
+
+    function formatClaimTime(ts) {
+      const d = new Date((Number(ts) || 0) * 1000);
+      if (Number.isNaN(d.getTime())) return '—';
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${pad(d.getDate())}.${pad(d.getMonth() + 1)} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    }
+
+    function renderClaimHistory() {
+      if (!el.claimsHistoryList) return;
+      if (!claimHistory.length) {
+        el.claimsHistoryList.innerHTML =
+          '<p class="text-slate-600 text-center py-6">Пока пусто — успешные клеймы появятся здесь</p>';
+        return;
+      }
+      el.claimsHistoryList.innerHTML = claimHistory.map((c) => `
+        <div class="rounded-xl border border-white/5 bg-ink-800/80 px-4 py-3">
+          <div class="flex items-baseline justify-between gap-2 mb-1">
+            <span class="font-semibold text-white truncate">${escapeHtml(c.name || '???')}</span>
+            <span class="text-[10px] text-slate-500 tabular-nums shrink-0">${escapeHtml(formatClaimTime(c.ts))}</span>
+          </div>
+          <p class="text-[11px] text-slate-500 truncate mb-1">${escapeHtml(c.series || '')}</p>
+          <p class="text-[11px] text-slate-400">
+            Цена <span class="text-accent-mint font-semibold">${escapeHtml(String(c.power ?? 0))}</span>
+            ${c.kakera ? ` · +${escapeHtml(String(c.kakera))} kakera` : ''}
+            ${c.ourospheres ? ` · +${escapeHtml(String(c.ourospheres))} ouros` : ''}
+          </p>
+        </div>
+      `).join('');
+    }
+
+    function openClaimsModal() {
+      if (!el.claimsModal) return;
+      el.claimsModal.classList.remove('hidden');
+      el.claimsModal.classList.add('flex');
+      renderClaimHistory();
+    }
+
+    function closeClaimsModal() {
+      if (!el.claimsModal) return;
+      el.claimsModal.classList.add('hidden');
+      el.claimsModal.classList.remove('flex');
+    }
+
+    function applyMinigames(data) {
+      if (!data) return;
+      for (const key of ['oh', 'oc', 'oq']) {
+        const entry = data[key] || {};
+        minigameReadyAt[key] = entry.ready_at != null ? Number(entry.ready_at) : null;
+      }
+      tickMinigames();
+    }
+
+    function tickMinigames() {
+      const now = Date.now() / 1000;
+      const map = { oh: el.cdOh, oc: el.cdOc, oq: el.cdOq };
+      for (const key of ['oh', 'oc', 'oq']) {
+        const readyAt = minigameReadyAt[key];
+        if (readyAt == null) {
+          map[key].textContent = 'Готово';
+          continue;
+        }
+        map[key].textContent = formatSecondsLeft(readyAt - now);
+      }
+    }
+
+    function applySettings(_data) {
+      // legacy no-op: форма строится из vars_update
+    }
+
+    function listToInput(value) {
+      if (!Array.isArray(value)) return '';
+      return value.map((v) => String(v)).join(', ');
+    }
+
+    function renderVarsForm(payload) {
+      if (!payload || !payload.values) return;
+      varsMeta = payload;
+      const secrets = new Set(payload.secrets || []);
+      const types = payload.types || {};
+      const values = payload.values || {};
+      const sections = (payload.sections || []).filter((s) => (s.keys || []).length);
+      const known = new Set();
+      sections.forEach((s) => (s.keys || []).forEach((k) => known.add(k)));
+      const orphanKeys = (payload.order || Object.keys(values)).filter((k) => !known.has(k));
+      if (orphanKeys.length) {
+        sections.push({ title: 'Прочее', keys: orphanKeys });
+      }
+
+      el.varsForm.innerHTML = '';
+      for (const section of sections) {
+        const box = document.createElement('div');
+        box.className = 'space-y-3';
+        box.innerHTML = `<h3 class="font-display text-sm font-bold text-slate-300 tracking-wide">${escapeHtml(section.title)}</h3>`;
+        const grid = document.createElement('div');
+        grid.className = 'grid md:grid-cols-2 gap-3';
+
+        for (const key of section.keys) {
+          const type = types[key] || 'string';
+          const value = values[key];
+          const field = document.createElement('div');
+          field.className = 'rounded-xl bg-ink-800/80 border border-white/5 px-4 py-3';
+
+          if (type === 'bool') {
+            field.innerHTML = `
+              <label class="flex items-center justify-between gap-4 cursor-pointer">
+                <span class="text-sm text-white font-semibold">${escapeHtml(key)}</span>
+                <span class="toggle">
+                  <input type="checkbox" data-var-key="${escapeHtml(key)}" data-var-type="bool" ${value ? 'checked' : ''} />
+                  <span class="slider"></span>
+                </span>
+              </label>`;
+          } else if (type === 'list') {
+            field.classList.add('md:col-span-2');
+            field.innerHTML = `
+              <label class="block">
+                <span class="text-sm text-white font-semibold">${escapeHtml(key)}</span>
+                <span class="block text-[10px] text-slate-500 mb-1">Список через запятую</span>
+                <textarea data-var-key="${escapeHtml(key)}" data-var-type="list" rows="2"
+                  class="mt-1 w-full rounded-lg bg-ink-950/80 border border-white/10 px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-accent-mint/40">${escapeHtml(listToInput(value))}</textarea>
+              </label>`;
+          } else if (type === 'number') {
+            field.innerHTML = `
+              <label class="block">
+                <span class="text-sm text-white font-semibold">${escapeHtml(key)}</span>
+                <input type="number" step="any" data-var-key="${escapeHtml(key)}" data-var-type="number"
+                  value="${escapeHtml(String(value ?? ''))}"
+                  class="mt-2 w-full rounded-lg bg-ink-950/80 border border-white/10 px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-accent-mint/40" />
+              </label>`;
+          } else {
+            const inputType = secrets.has(key) ? 'password' : 'text';
+            field.innerHTML = `
+              <label class="block">
+                <span class="text-sm text-white font-semibold">${escapeHtml(key)}</span>
+                <input type="${inputType}" data-var-key="${escapeHtml(key)}" data-var-type="string" autocomplete="off"
+                  value="${escapeHtml(String(value ?? ''))}"
+                  class="mt-2 w-full rounded-lg bg-ink-950/80 border border-white/10 px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-accent-mint/40" />
+              </label>`;
+          }
+          grid.appendChild(field);
+        }
+        box.appendChild(grid);
+        el.varsForm.appendChild(box);
+      }
+    }
+
+    function collectVarsFromForm() {
+      const settings = {};
+      el.varsForm.querySelectorAll('[data-var-key]').forEach((input) => {
+        const key = input.dataset.varKey;
+        const type = input.dataset.varType;
+        if (type === 'bool') {
+          settings[key] = !!input.checked;
+        } else if (type === 'number') {
+          const n = Number(input.value);
+          settings[key] = Number.isFinite(n) ? n : input.value;
+        } else if (type === 'list') {
+          const text = String(input.value || '').trim();
+          if (!text) {
+            settings[key] = [];
+          } else if (text.startsWith('[')) {
+            settings[key] = JSON.parse(text);
+          } else {
+            settings[key] = text.split(',').map((s) => s.trim()).filter(Boolean);
+          }
+        } else {
+          settings[key] = String(input.value ?? '');
+        }
+      });
+      return settings;
+    }
+
+    function renderBuffer() {
+      const now = Date.now();
+      const alive = [];
+      for (const [id, card] of bufferCards) {
+        const left = card.expiresAt - now;
+        if (left <= 0) {
+          bufferCards.delete(id);
+          continue;
+        }
+        alive.push({ id, ...card, left });
+      }
+
+      const aliveIds = new Set(alive.map((c) => c.id));
+      // Удаляем только истёкшие/лишние ноды — не трогаем живые (иначе fade-in мигает)
+      el.buffer.querySelectorAll('[data-card-id]').forEach((n) => {
+        if (!aliveIds.has(n.dataset.cardId)) n.remove();
+      });
+
+      if (alive.length === 0) {
+        el.bufferEmpty.classList.remove('hidden');
+        return;
+      }
+      el.bufferEmpty.classList.add('hidden');
+
+      for (const card of alive) {
+        const ttl = card.ttlMs || bufferTtlMs;
+        const pct = Math.max(0, Math.min(100, (card.left / ttl) * 100));
+        const sec = (card.left / 1000).toFixed(1);
+        let node = el.buffer.querySelector(`[data-card-id="${CSS.escape(card.id)}"]`);
+        if (!node) {
+          node = document.createElement('div');
+          node.dataset.cardId = card.id;
+          node.className = 'rounded-xl border border-accent-mint/20 bg-ink-800/90 px-4 py-3 fade-in';
+          node.innerHTML = `
+            <div class="flex items-baseline justify-between gap-2 mb-1">
+              <span class="font-display text-2xl font-extrabold text-accent-mint tabular-nums" data-power></span>
+              <span class="text-[10px] text-slate-500 tabular-nums" data-sec></span>
+            </div>
+            <p class="text-[10px] uppercase tracking-wider text-slate-500 mb-0.5">Цена персонажа</p>
+            <p class="text-sm text-white truncate font-semibold" data-name></p>
+            <p class="text-[11px] text-slate-500 truncate mb-2" data-series></p>
+            <div class="progress-track"><div class="progress-fill" data-bar style="width:100%"></div></div>
+          `;
+          el.buffer.appendChild(node);
+          node.querySelector('[data-power]').textContent = String(card.power ?? '');
+          node.querySelector('[data-name]').textContent = card.name || '???';
+          node.querySelector('[data-series]').textContent = card.series || '';
+        }
+        node.querySelector('[data-sec]').textContent = `${sec}s`;
+        node.querySelector('[data-bar]').style.width = `${pct}%`;
+      }
+    }
+
+    function rowMatchesLogFilter(row) {
+      const tag = (row.dataset.logTag || '').toUpperCase();
+      const text = (row.dataset.logText || '').toLowerCase();
+      if (logFilterTag !== 'ALL' && tag !== logFilterTag) return false;
+      if (logSearchQuery && !text.includes(logSearchQuery)) return false;
+      return true;
+    }
+
+    function applyLogFilters() {
+      el.log.querySelectorAll('[data-log-tag]').forEach((row) => {
+        row.classList.toggle('log-row-hidden', !rowMatchesLogFilter(row));
+      });
+    }
+
+    function appendLog(data) {
+      const row = document.createElement('div');
+      row.className = 'fade-in flex gap-2 items-start py-1 border-b border-white/[0.03]';
+
+      const tag = (data.tag || 'SYS').toUpperCase();
+      const time = data.time || '';
+      const dimClass = data.dim ? 'opacity-50' : '';
+      const plain =
+        tag === 'DROP'
+          ? `DROP ${data.power ?? ''} ${data.name || ''} ${data.series || ''} ${data.status || ''}`
+          : `${tag} ${data.message || ''}`;
+
+      row.dataset.logTag = tag;
+      row.dataset.logText = `${time} ${plain}`.toLowerCase();
+
+      if (tag === 'DROP' && (data.power != null || data.name)) {
+        const status = data.status || '';
+        const free = /свободн/i.test(status);
+        row.innerHTML = `
+          <span class="text-slate-600 shrink-0 tabular-nums text-xs pt-1">[${escapeHtml(time)}]</span>
+          <span class="tag-DROP shrink-0 text-xs font-semibold pt-1 w-14">DROP</span>
+          <div class="${dimClass} leading-tight">
+            <span class="text-[10px] uppercase tracking-wider text-slate-500 mr-1">Цена</span>
+            <span class="stat-num text-xl font-extrabold text-accent-mint mr-2">${escapeHtml(String(data.power ?? '?'))}</span>
+            <span class="text-base text-white font-semibold">${escapeHtml(data.name || data.message || '')}</span>
+            ${data.series ? `<span class="text-slate-500 text-sm"> · ${escapeHtml(data.series)}</span>` : ''}
+            <span class="ml-2 text-xs ${free ? 'text-accent-mint' : 'text-accent-rose'}">${escapeHtml(status)}</span>
+          </div>
+        `;
+      } else {
+        row.innerHTML = `
+          <span class="text-slate-600 shrink-0 tabular-nums text-xs">[${escapeHtml(time)}]</span>
+          <span class="tag-${tag} shrink-0 text-xs font-semibold w-14">${escapeHtml(tag)}</span>
+          <span class="${dimClass} text-slate-300 break-words">${escapeHtml(data.message || '')}</span>
+        `;
+      }
+
+      if (!rowMatchesLogFilter(row)) row.classList.add('log-row-hidden');
+
+      el.log.appendChild(row);
+      while (el.log.children.length > 400) {
+        el.log.removeChild(el.log.firstChild);
+      }
+      el.log.scrollTop = el.log.scrollHeight;
+    }
+
+    function exportVisibleLog() {
+      const lines = [];
+      el.log.querySelectorAll('[data-log-tag]').forEach((row) => {
+        if (row.classList.contains('log-row-hidden')) return;
+        lines.push(row.innerText.replace(/\s+\n/g, '\n').trim());
+      });
+      const blob = new Blob([lines.join('\n') || '(пусто)'], { type: 'text/plain;charset=utf-8' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `mudae-log-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.txt`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }
+
+    document.querySelectorAll('.tab-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const tab = btn.dataset.tab;
+        document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        document.getElementById('tab-dashboard').classList.toggle('panel-hidden', tab !== 'dashboard');
+        document.getElementById('tab-settings').classList.toggle('panel-hidden', tab !== 'settings');
+      });
+    });
+
+    document.querySelectorAll('[data-log-filter]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        logFilterTag = btn.dataset.logFilter || 'ALL';
+        document.querySelectorAll('[data-log-filter]').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        applyLogFilters();
+      });
+    });
+
+    if (el.logSearch) {
+      el.logSearch.addEventListener('input', () => {
+        logSearchQuery = String(el.logSearch.value || '').trim().toLowerCase();
+        applyLogFilters();
+      });
+    }
+
+    const exportBtn = document.getElementById('btn-export-log');
+    if (exportBtn) exportBtn.addEventListener('click', exportVisibleLog);
+
+    setInterval(renderBuffer, 200);
+    setInterval(tickMinigames, 1000);
+    setInterval(tickNextRoll, 1000);
+    setInterval(() => {
+      const elapsed = (Date.now() - lastUptimeAt) / 1000;
+      el.uptime.textContent = formatUptime(lastUptime + elapsed);
+    }, 1000);
+
+    const socket = io({ transports: ['websocket', 'polling'] });
+
+    socket.on('connect', () => {
+      el.connDot.className = 'inline-block w-2 h-2 rounded-full bg-accent-mint';
+      el.connLabel.textContent = 'online';
+    });
+
+    socket.on('disconnect', () => {
+      el.connDot.className = 'inline-block w-2 h-2 rounded-full bg-accent-rose';
+      el.connLabel.textContent = 'offline';
+    });
+
+    socket.on('stats_update', (data) => {
+      applyStats(data);
+      if (typeof data.uptime === 'number') {
+        lastUptime = data.uptime;
+        lastUptimeAt = Date.now();
+      }
+    });
+
+    socket.on('profile_update', applyProfile);
+    socket.on('minigames_update', applyMinigames);
+    socket.on('settings_update', applySettings);
+    socket.on('vars_update', renderVarsForm);
+    socket.on('config_update', applyConfig);
+
+    socket.on('log_history', (logs) => {
+      el.log.innerHTML = '';
+      (logs || []).forEach(appendLog);
+    });
+
+    socket.on('log_event', (data) => appendLog(data || {}));
+
+    socket.on('buffer_card', (card) => {
+      if (!card) return;
+      const id = String(card.msg_id || card.id || `${card.name}-${card.power}-${Date.now()}`);
+      const ttlMs = card.ttl_ms || ((card.claim_ttl || claimTtlSec) * 1000);
+      bufferCards.set(id, {
+        name: card.name,
+        series: card.series,
+        power: card.power,
+        ttlMs,
+        expiresAt: Date.now() + ttlMs,
+      });
+      renderBuffer();
+    });
+
+    socket.on('buffer_clear', () => {
+      bufferCards.clear();
+      renderBuffer();
+    });
+
+    socket.on('claim_history_update', (rows) => {
+      claimHistory = Array.isArray(rows) ? rows : [];
+      if (el.claims) {
+        if (!claimHistory.length) {
+          el.claims.textContent = '0';
+        } else {
+          // Не затираем счётчик из stats_update, если он больше
+          const n = Number(el.claims.textContent) || 0;
+          if (claimHistory.length > n) el.claims.textContent = String(claimHistory.length);
+        }
+      }
+      if (el.claimsModal && !el.claimsModal.classList.contains('hidden')) {
+        renderClaimHistory();
+      }
+    });
+
+    if (el.claimsCard) el.claimsCard.addEventListener('click', openClaimsModal);
+    const claimsClose = document.getElementById('claims-modal-close');
+    const claimsClear = document.getElementById('claims-history-clear');
+    if (claimsClose) claimsClose.addEventListener('click', closeClaimsModal);
+    if (claimsClear) {
+      claimsClear.addEventListener('click', () => {
+        if (!claimHistory.length) return;
+        if (!confirm('Очистить историю клеймов? Счётчик успешных свадеб тоже обнулится.')) return;
+        socket.emit('clear_claim_history', {});
+      });
+    }
+    if (el.claimsModal) {
+      el.claimsModal.addEventListener('click', (ev) => {
+        if (ev.target === el.claimsModal) closeClaimsModal();
+      });
+    }
+
+    socket.on('action_result', (data) => {
+      if (!data) return;
+      const msg = data.ok
+        ? `OK: ${data.action}${data.setting ? ` (${data.setting}=${data.value})` : ''}${data.restarting ? ' · перезапуск…' : ''}`
+        : `ERR: ${data.error || data.action}`;
+      el.actionHint.textContent = msg;
+      if (el.varsHint && data.action === 'save_vars') {
+        el.varsHint.textContent = msg;
+      }
+    });
+
+    document.getElementById('btn-save-vars').addEventListener('click', () => {
+      let settings;
+      try {
+        settings = collectVarsFromForm();
+      } catch (err) {
+        el.varsHint.textContent = `ERR: ${err.message || err}`;
+        return;
+      }
+      if (!confirm('Сохранить Vars.py и перезапустить бота?')) return;
+      el.varsHint.textContent = 'Сохраняю и перезапускаю…';
+      el.actionHint.textContent = 'Сохраняю Vars.py…';
+      socket.emit('save_vars', { settings });
+    });
+
+    document.getElementById('btn-refresh-tu').addEventListener('click', () => {
+      el.actionHint.textContent = 'Обновляю $tu…';
+      socket.emit('force_tu_update', {});
+    });
+    document.getElementById('btn-force-roll').addEventListener('click', () => {
+      el.actionHint.textContent = 'Запускаю прокрут…';
+      socket.emit('force_roll', {});
+    });
+    document.getElementById('btn-force-minigames').addEventListener('click', () => {
+      el.actionHint.textContent = 'Запускаю миниигры…';
+      socket.emit('force_minigames', {});
+    });
+    document.getElementById('btn-restart').addEventListener('click', () => {
+      if (!confirm('Перезапустить бота? Процесс Python будет завершён.')) return;
+      el.actionHint.textContent = 'Перезапуск…';
+      socket.emit('restart_bot', {});
+    });
+  </script>
+</body>
+</html>

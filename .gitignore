@@ -1,0 +1,11 @@
+venv/
+Vars.py
+claim_history.json
+mudae_history.db
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc
+.idea/
+.vscode/

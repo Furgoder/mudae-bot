@@ -1,0 +1,5 @@
+discum
+requests
+schedule
+flask
+flask-socketio
