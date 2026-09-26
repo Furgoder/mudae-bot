@@ -245,41 +245,6 @@ def _pick_harvest_target(buttons, prefer_cell, warned_unknown):
     return target, reason
 
 
-def _available_buttons(message, clicked_custom_ids):
-    """Плоский список доступных кнопок с координатами поля (x, y), от 1."""
-    result = []
-    for y, row in enumerate(message.get('components', []), start=1):
-        for x, button in enumerate(row.get('components', []), start=1):
-            custom_id = button.get('custom_id')
-            if button.get('type') != 2 or button.get('disabled') or custom_id in clicked_custom_ids:
-                continue
-            if not custom_id:
-                continue
-            result.append({
-                'x': x,
-                'y': y,
-                'button': button,
-                'sphere': _sphere_name(button),
-            })
-    return result
-
-
-def _log_matrix(buttons):
-    cells = {(item['x'], item['y']): item for item in buttons}
-    _mg_log('[bold cyan]Текущее поле Ourospheres:[/bold cyan]')
-    for y in range(1, 6):
-        row = []
-        for x in range(1, 6):
-            item = cells.get((x, y))
-            if item is None:
-                row.append('     --     ')
-                continue
-            emoji_name = item['button'].get('emoji', {}).get('name', '?')
-            sphere = item['sphere'] or emoji_name
-            row.append(f'{sphere[:10]:^12}')
-        _mg_log(' | '.join(row))
-
-
 def _get_message(message_id):
     """Находит сообщение в доступной self-боту истории канала."""
     response = requests.get(url, headers=auth, params={'limit': 10}, timeout=5)
@@ -633,8 +598,15 @@ def _quest_purple_probabilities(board, known_empty, known_purple):
     return counts, total
 
 
-def _pick_quest_target(buttons, board, known_empty, known_purple, purple_clicked):
+def _pick_quest_target(buttons, board, known_empty, known_purple, purple_clicked, clicked_cells=None):
     """Ищем Purple (3 штуки), затем 4-ю клетку — она станет Red+."""
+    clicked_cells = clicked_cells or set()
+    remaining = [
+        item for item in buttons
+        if (item['x'], item['y']) not in clicked_cells
+    ]
+    # Уже кликнутые, но всё ещё активные — только если других ходов не осталось.
+    buttons = remaining or buttons
     cells = {(item['x'], item['y']): item for item in buttons}
 
     # Уже открытый джекпот на поле — забираем сразу.
@@ -708,7 +680,7 @@ def _pick_quest_target(buttons, board, known_empty, known_purple, purple_clicked
     return target, f"возможную Purple (x:{target['x']}, y:{target['y']})"
 
 
-def _wait_for_render(message_id, previous_components, timeout=3):
+def _wait_for_render(message_id, previous_components, timeout=8):
     """Ожидает фактического обновления components после interaction-клика."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -739,9 +711,11 @@ def _drain_minigame(play_once, label):
         )
 
 
+_MINIGAME_MAX_CLICKS = 30  # предохранитель, если Discord не пометит кнопки disabled
+
+
 def _play_ouroharvest_once():
     """Один раунд $oh: кликает, пока на поле есть активные (не disabled) кнопки."""
-    _HARVEST_MAX_CLICKS = 30  # предохранитель от бесконечного цикла
 
     _mg_log('[bold cyan]Ouroharvest: отправляю $oh.[/bold cyan]')
     try:
@@ -786,9 +760,9 @@ def _play_ouroharvest_once():
             )
             break
 
-        if click_count >= _HARVEST_MAX_CLICKS:
+        if click_count >= _MINIGAME_MAX_CLICKS:
             _mg_log(
-                f'[yellow]Достигнут предел {_HARVEST_MAX_CLICKS} кликов — '
+                f'[yellow]Достигнут предел {_MINIGAME_MAX_CLICKS} кликов — '
                 f'останавливаюсь (что-то пошло не так).[/yellow]'
             )
             break
@@ -822,7 +796,7 @@ def _play_ouroharvest_once():
         rendered = _wait_for_render(message_id, previous_components)
         if rendered is None:
             _mg_log(
-                '[yellow]Discord не обновил поле за 3 секунды; '
+                '[yellow]Discord не обновил поле за 8 секунд; '
                 'завершаю во избежание повторного клика.[/yellow]'
             )
             return {'status': 'error', 'retry_after': 300}
@@ -883,7 +857,7 @@ def play_ouroharvest():
 
 
 def _play_ourochest_once():
-    """Один раунд $oc: до 5 ходов — Red, затем Orange/Yellow/Green/Teal."""
+    """Один раунд $oc: кликает, пока на поле есть активные (не disabled) кнопки."""
     _mg_log('[bold cyan]Ourochest: отправляю $oc.[/bold cyan]')
     try:
         action_pause()
@@ -922,25 +896,41 @@ def _play_ourochest_once():
         f'(центр 3,3 исключён).'
     )
 
-    clicked_custom_ids = set()
     found_red = False
     red_pos = None
+    click_count = 0
+    warned_no_reds = False
 
-    for move_index in range(5):
-        buttons = _available_buttons(message, clicked_custom_ids)
+    while True:
+        buttons = _clickable_buttons(message)
         if not buttons:
-            _mg_log('[yellow]Доступных кнопок больше нет — завершаю игру.[/yellow]')
-            break
-        if red_pos is None and not possible_reds:
-            _mg_log('[bold red]Кандидаты Red исчерпаны — логика разошлась с полем.[/bold red]')
+            _mg_log(
+                '[yellow]Активных кнопок больше нет — раунд $oc завершён '
+                '(все клетки disabled, как в Discord).[/yellow]'
+            )
             break
 
-        _log_matrix(buttons)
+        if click_count >= _MINIGAME_MAX_CLICKS:
+            _mg_log(
+                f'[yellow]Достигнут предел {_MINIGAME_MAX_CLICKS} кликов — '
+                f'останавливаюсь (что-то пошло не так).[/yellow]'
+            )
+            break
+
+        if red_pos is None and not possible_reds and not warned_no_reds:
+            warned_no_reds = True
+            _mg_log(
+                '[yellow]Кандидаты Red исчерпаны — логика разошлась с полем. '
+                'Продолжаю по оставшимся активным кнопкам.[/yellow]'
+            )
+
+        _log_full_board(message, title='Текущее поле Ourochest')
         if red_pos is not None:
             target, reason = _pick_chest_target_after_red(buttons, red_pos)
         else:
-            target, reason = _pick_chest_target(buttons, possible_reds, move_index)
+            target, reason = _pick_chest_target(buttons, possible_reds, click_count)
         cx, cy = target['x'], target['y']
+        click_count += 1
 
         candidates_note = (
             f'Ищем бонус у Red {red_pos}.'
@@ -948,8 +938,9 @@ def _play_ourochest_once():
             else f'Кандидатов Red: [magenta]{len(possible_reds)}[/magenta].'
         )
         _mg_log(
-            f"[bold]Ход {move_index + 1}/5:[/bold] нажимаю {reason} "
-            f"в [cyan](x:{cx}, y:{cy})[/cyan]. {candidates_note}"
+            f"[bold]Ход {click_count}:[/bold] нажимаю {reason} "
+            f"в [cyan](x:{cx}, y:{cy})[/cyan]. {candidates_note} "
+            f'Активных кнопок: [magenta]{len(buttons)}[/magenta].'
         )
 
         previous_components = _components_snapshot(message)
@@ -967,12 +958,10 @@ def _play_ourochest_once():
             _mg_log(f'[bold red]Ошибка нажатия: {error}[/bold red]')
             return {'status': 'error', 'retry_after': 300}
 
-        clicked_custom_ids.add(target['button']['custom_id'])
-
         rendered = _wait_for_render(message_id, previous_components)
         if rendered is None:
             _mg_log(
-                '[yellow]Discord не обновил поле за 3 секунды; '
+                '[yellow]Discord не обновил поле за 8 секунд; '
                 'завершаю во избежание повторного клика.[/yellow]'
             )
             return {'status': 'error', 'retry_after': 300}
@@ -1003,7 +992,7 @@ def _play_ourochest_once():
                 _mg_log(
                     f'[bold green]Red найдена в (x:{cx}, y:{cy})! '
                     f'Ценность {sphere_values["Red"]}. '
-                    f'Продолжаю искать Orange → Yellow → Green…[/bold green]'
+                    f'Продолжаю, пока кнопки активны: Orange → Yellow → Green…[/bold green]'
                 )
         else:
             _mg_log(
@@ -1011,10 +1000,17 @@ def _play_ourochest_once():
                 f'ходы ещё есть — целимся в следующую лучшую сферу.'
             )
 
-        _mg_log('[green]Поле обновилось.[/green]')
+        active_left = len(_clickable_buttons(message))
+        _mg_log(
+            f'[green]Поле обновилось.[/green] '
+            f'Активных кнопок осталось: [magenta]{active_left}[/magenta].'
+        )
 
     if found_red:
-        _mg_log('[bold green]Ourochest завершён: Red найдена, бонусные ходы использованы.[/bold green]')
+        _mg_log(
+            f'[bold green]Ourochest завершён: Red найдена, '
+            f'ходов {click_count}.[/bold green]'
+        )
         return {'status': 'completed', 'found_red': True, 'retry_after': 24 * 60 * 60}
 
     if len(possible_reds) == 1:
@@ -1036,7 +1032,7 @@ def play_ourochest():
 
 
 def _play_ouroquest_once():
-    """Один раунд $oq: за 7 ходов ищет 3 Purple, затем забирает 4-ю (Red+)."""
+    """Один раунд $oq: ищет Purple/джекпот и кликает, пока кнопки не disabled."""
     _mg_log('[bold cyan]Ouroquest: отправляю $oq.[/bold cyan]')
     try:
         action_pause()
@@ -1069,17 +1065,28 @@ def _play_ouroquest_once():
 
     known_empty = set()
     known_purple = set()
-    clicked_custom_ids = set()
     purple_clicked = 0
     jackpot = None
+    click_count = 0
+    clicked_cells = set()
 
-    for move_index in range(7):
+    while True:
         board = _board_map(message)
         _analyze_quest_field(board, known_empty, known_purple)
 
-        buttons = _available_buttons(message, clicked_custom_ids)
+        buttons = _clickable_buttons(message)
         if not buttons:
-            _mg_log('[yellow]Доступных кнопок больше нет — завершаю игру.[/yellow]')
+            _mg_log(
+                '[yellow]Активных кнопок больше нет — раунд $oq завершён '
+                '(все клетки disabled, как в Discord).[/yellow]'
+            )
+            break
+
+        if click_count >= _MINIGAME_MAX_CLICKS:
+            _mg_log(
+                f'[yellow]Достигнут предел {_MINIGAME_MAX_CLICKS} кликов — '
+                f'останавливаюсь (что-то пошло не так).[/yellow]'
+            )
             break
 
         _log_full_board(message, title='Текущее поле Ouroquest')
@@ -1094,13 +1101,15 @@ def _play_ouroquest_once():
         )
 
         target, reason = _pick_quest_target(
-            buttons, board, known_empty, known_purple, purple_clicked
+            buttons, board, known_empty, known_purple, purple_clicked, clicked_cells
         )
         cx, cy = target['x'], target['y']
+        click_count += 1
 
         _mg_log(
-            f'[bold]Ход {move_index + 1}/7:[/bold] нажимаю {reason} '
-            f'в [cyan](x:{cx}, y:{cy})[/cyan].'
+            f'[bold]Ход {click_count}:[/bold] нажимаю {reason} '
+            f'в [cyan](x:{cx}, y:{cy})[/cyan]. '
+            f'Активных кнопок: [magenta]{len(buttons)}[/magenta].'
         )
 
         previous_components = _components_snapshot(message)
@@ -1118,13 +1127,13 @@ def _play_ouroquest_once():
             _mg_log(f'[bold red]Ошибка нажатия: {error}[/bold red]')
             return {'status': 'error', 'retry_after': 300}
 
-        clicked_custom_ids.add(target['button']['custom_id'])
         known_empty.discard((cx, cy))
+        clicked_cells.add((cx, cy))
 
         rendered = _wait_for_render(message_id, previous_components)
         if rendered is None:
             _mg_log(
-                '[yellow]Discord не обновил поле за 3 секунды; '
+                '[yellow]Discord не обновил поле за 8 секунд; '
                 'завершаю во избежание повторного клика.[/yellow]'
             )
             return {'status': 'error', 'retry_after': 300}
@@ -1153,9 +1162,9 @@ def _play_ouroquest_once():
             known_empty.discard((cx, cy))
             _mg_log(
                 f'[bold green]Джекпот! {color} '
-                f'(ценность {sphere_values[color]}).[/bold green]'
+                f'(ценность {sphere_values[color]}). '
+                f'Продолжаю, пока кнопки активны.[/bold green]'
             )
-            break
         elif color in _QUEST_PURPLE_COUNTS:
             known_empty.add((cx, cy))
             known_purple.discard((cx, cy))
@@ -1166,17 +1175,22 @@ def _play_ouroquest_once():
 
         board = _board_map(message)
         _analyze_quest_field(board, known_empty, known_purple)
+        active_left = len(_clickable_buttons(message))
         _mg_log(
             f'[cyan]После хода → пустые[/cyan] '
             f'[green]{sorted(known_empty)}[/green] | '
             f'[cyan]Purple[/cyan] '
             f'[magenta]{sorted(known_purple)}[/magenta]'
         )
-        _mg_log('[green]Поле обновилось.[/green]')
+        _mg_log(
+            f'[green]Поле обновилось.[/green] '
+            f'Активных кнопок осталось: [magenta]{active_left}[/magenta].'
+        )
 
     if jackpot:
         _mg_log(
-            f'[bold green]Ouroquest завершён: джекпот {jackpot}.[/bold green]'
+            f'[bold green]Ouroquest завершён: джекпот {jackpot}, '
+            f'ходов {click_count}.[/bold green]'
         )
         return {
             'status': 'completed',
@@ -1187,7 +1201,7 @@ def _play_ouroquest_once():
 
     _mg_log(
         f'[yellow]Ouroquest завершён. Purple кликнуто: {purple_clicked}/3, '
-        f'известные Purple={sorted(known_purple)}.[/yellow]'
+        f'ходов {click_count}, известные Purple={sorted(known_purple)}.[/yellow]'
     )
     return {
         'status': 'completed',
