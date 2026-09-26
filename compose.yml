@@ -1,0 +1,12 @@
+services:
+  bot:
+    build: .
+    image: mudae-bot
+    container_name: mudae
+    ports:
+      - "5000:5000"
+    environment:
+      TZ: Asia/Almaty
+    volumes:
+      - ./Vars.py:/app/Vars.py
+    restart: unless-stopped

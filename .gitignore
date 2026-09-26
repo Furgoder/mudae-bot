@@ -9,3 +9,7 @@ __pycache__/
 *.pyc
 .idea/
 .vscode/
+
+# Local Docker / secrets — never commit
+.env
+compose.override.yml

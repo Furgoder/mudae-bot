@@ -1,0 +1,12 @@
+venv/
+.git/
+__pycache__/
+*.pyc
+*.bat
+Vars.py
+*.db
+*.db-wal
+*.db-shm
+claim_history.json
+.idea/
+.vscode/
