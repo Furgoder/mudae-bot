@@ -2,6 +2,7 @@ import discum
 import json
 import random
 import re
+import threading
 import time
 import requests
 import Vars
@@ -177,6 +178,9 @@ _processed_message_ids = {}
 # Кэш Discord-имён (display + login)
 _CACHED_USERNAME = None
 _CACHED_USERNAMES = None
+_CACHED_USER_ID = None
+# Слушатель канала поднял подписку (Sniper выставляет после lazyGuild).
+GATEWAY_LISTENING = threading.Event()
 
 # Сценарий A: отказ / КД какеры
 # "username, You can't react to kakera for 1h 01 min. ($ku)"
@@ -292,9 +296,15 @@ def _resolve_username():
     return names[0] if names else ''
 
 
+def _our_user_id():
+    """Discord id нашего аккаунта (кэш GET /users/@me)."""
+    _our_discord_names()
+    return _CACHED_USER_ID or ''
+
+
 def _our_discord_names():
     """Возможные имена аккаунта (display / username / Vars.username)."""
-    global _CACHED_USERNAME, _CACHED_USERNAMES
+    global _CACHED_USERNAME, _CACHED_USERNAMES, _CACHED_USER_ID
     names = []
     configured = (getattr(Vars, 'username', None) or '').strip()
     if configured:
@@ -308,6 +318,7 @@ def _our_discord_names():
             )
             if response.status_code == 200:
                 data = response.json()
+                _CACHED_USER_ID = str(data.get('id') or '')
                 display = (data.get('global_name') or '').strip()
                 login = (data.get('username') or '').strip()
                 if display:
@@ -1224,33 +1235,86 @@ def _iter_message_buttons(components):
 
 
 # Ценность какеры для сортировки кликов: сначала самые дорогие.
+# Золотая — kakeraY. Имя «kakera» без суффикса тоже есть в Mudae, но берём его
+# только если оно записано в Vars.desiredKakeras.
 KAKERA_VALUES = {
     'kakeraW': 8,
     'kakeraL': 7,
+    'kakeraD': 7,
+    'kakeraC': 7,
     'kakeraR': 6,
     'kakeraO': 5,
     'kakeraY': 4,
+    'kakeraG': 3,
     'kakeraT': 3,
     'kakeraB': 2,
     'kakeraP': 1,
+    'kakera': 1,
 }
+
+# Ourosphere на карточке ролла (кнопка рядом с какерой). Имена — custom emoji Mudae.
+OUROSPHERE_VALUES = {
+    'sp': 150,
+    'spP': 5,
+    'spB': 10,
+    'spT': 20,
+    'spG': 35,
+    'spY': 55,
+    'spO': 90,
+    'spW': 500,
+    'spL': 200,
+    'spD': 40,
+}
+_OUROSPHERE_VALUES_CF = {name.casefold(): value for name, value in OUROSPHERE_VALUES.items()}
+_KAKERA_VALUES_CF = {name.casefold(): value for name, value in KAKERA_VALUES.items()}
+
+
+def _button_emoji_name(button):
+    return (button.get('emoji') or {}).get('name') or ''
+
+
+def _is_ourosphere_name(name):
+    return (name or '').casefold() in _OUROSPHERE_VALUES_CF
+
+
+def _kakera_click_names():
+    """Какие какеры жать. Только Vars.desiredKakeras — пользователь сам выбирает."""
+    configured = getattr(Vars, 'desiredKakeras', []) or []
+    return {str(name).casefold() for name in configured}
 
 
 def _is_kakera_button(button):
-    name = (button.get('emoji') or {}).get('name') or ''
-    desired = getattr(Vars, 'desiredKakeras', []) or []
-    return name in desired or name.lower().startswith('kakera')
+    name = _button_emoji_name(button)
+    return name.casefold() in _kakera_click_names() or name.lower().startswith('kakera')
+
+
+def _is_ourosphere_button(button):
+    return _is_ourosphere_name(_button_emoji_name(button))
 
 
 def _kakera_targets(message):
-    """Включённые кнопки из desiredKakeras, дорогие первыми."""
-    desired = getattr(Vars, 'desiredKakeras', []) or []
+    """Кнопки какеры и ourosphere. Сферы — даже на КД какеры, дорогие первыми.
+
+    Сфера не тратит реакцию $k, поэтому её берём, когда какера в кулдауне.
+    """
+    kakera_names = _kakera_click_names()
+    take_kakera = not kakera_on_cooldown()
     targets = []
     for button in _iter_message_buttons(message.get('components')):
-        emoji = (button.get('emoji') or {}).get('name') or ''
-        if emoji in desired:
+        emoji = _button_emoji_name(button)
+        key = emoji.casefold()
+        if key in _OUROSPHERE_VALUES_CF:
             targets.append((emoji, button))
-    targets.sort(key=lambda item: KAKERA_VALUES.get(item[0], 0), reverse=True)
+        elif take_kakera and key in kakera_names:
+            targets.append((emoji, button))
+
+    def _sort_key(item):
+        key = item[0].casefold()
+        if key in _OUROSPHERE_VALUES_CF:
+            return 1000 + _OUROSPHERE_VALUES_CF[key]
+        return _KAKERA_VALUES_CF.get(key, 0)
+
+    targets.sort(key=_sort_key, reverse=True)
     return targets
 
 
@@ -1300,34 +1364,43 @@ def _wait_kakera_buttons_ready(message, *, timeout=1.15):
     return current
 
 
-def click_desired_kakera(message, *, log_prefix='Найдена кнопка какеры'):
-    """Жмёт какеры по одной, каждый раз с актуальными custom_id.
+def click_desired_kakera(
+    message,
+    *,
+    log_prefix='Найдена кнопка какеры',
+    clicked_ids=None,
+    wait_for_buttons=True,
+):
+    """Жмёт какеры и ourosphere по одной, каждый раз с актуальными custom_id.
 
     Пачка кликов по первому снимку кнопки ломает 3-ю+: после $bku / клика
     Mudae правит сообщение, старые custom_id перестают работать, а новая
     какера появляется только в следующем GET.
+    Сферы (sp, spP, …) жмутся и когда какера в кулдауне.
+    clicked_ids — уже нажатые custom_id (чтобы правка сообщения не кликнула их снова).
     """
-    if not message or kakera_on_cooldown():
+    if not message:
         return 0
+    if clicked_ids is None:
+        clicked_ids = set()
 
     limit = int(getattr(Vars, 'kakera_max_clicks', 8))
     if limit <= 0:
         limit = 32
 
-    message = _wait_kakera_buttons_ready(message)
+    if wait_for_buttons:
+        message = _wait_kakera_buttons_ready(message)
+    elif not _kakera_targets(message):
+        message = _refresh_kakera_message(message)
     if not _kakera_targets(message):
         return 0
 
     channel_id = message.get('channel_id') or Vars.channelId
     guild_id = message.get('guild_id') or Vars.serverId
     clicks = 0
-    clicked_ids = set()
     last_poll_id = str(message['id'])
 
     while clicks < limit:
-        if kakera_on_cooldown():
-            break
-
         targets = [
             item for item in _kakera_targets(message)
             if item[1].get('custom_id') not in clicked_ids
@@ -1345,10 +1418,11 @@ def click_desired_kakera(message, *, log_prefix='Найдена кнопка к�
         emoji, button = targets[0]
         custom_id = button.get('custom_id')
         remaining = len(targets)
+        loot_label = 'ourosphere' if _is_ourosphere_name(emoji) else 'какеру'
         log_msg(
             'KAKER',
             f"{log_prefix}: {emoji}. "
-            f"Пытаюсь взять какеру №{clicks + 1} "
+            f"Пытаюсь взять {loot_label} №{clicks + 1} "
             f"(осталось на карте: {remaining})...",
             dim=True,
         )
@@ -1393,14 +1467,19 @@ def click_desired_kakera(message, *, log_prefix='Найдена кнопка к�
     return clicks
 
 
+def _is_loot_button(button):
+    """Какера или ourosphere — это не кнопка клейма."""
+    return _is_kakera_button(button) or _is_ourosphere_button(button)
+
+
 def find_claim_button(components):
-    """Ищет кнопку клейма среди components (сердце / claim / первая не-kakera)."""
+    """Ищет кнопку клейма среди components (сердце / claim / первая не-какера и не-сфера)."""
     buttons = list(_iter_message_buttons(components))
     if not buttons:
         return None
 
     for button in buttons:
-        if _is_kakera_button(button):
+        if _is_loot_button(button):
             continue
         emoji_name = ((button.get('emoji') or {}).get('name') or '').lower()
         label = (button.get('label') or '').lower()
@@ -1410,7 +1489,7 @@ def find_claim_button(components):
             return button
 
     for button in buttons:
-        if not _is_kakera_button(button):
+        if not _is_loot_button(button):
             return button
     return None
 
@@ -1591,6 +1670,564 @@ def _send_pokeslot():
         log_msg('WARN', f"Не удалось отправить Pokeslot (код: {poke_req.status_code})")
 
 
+# Сессия роллов: поток отправки только шлёт команды, карточки разбирает Gateway.
+_ROLL_LOCK = threading.Lock()
+_ROLL_SESSION = {
+    'active': False,
+    'limit_reached': False,
+    'claim_spent': False,
+    'claiming': False,
+    'claim_buffer': [],
+    'profile_state': None,
+    'current_threshold': 0.0,
+    'jackpot_threshold': 0.0,
+    'last_send_at': 0.0,
+    'last_event_at': 0.0,
+}
+_OWNER_BY_MESSAGE = {}
+_CLAIM_DECIDED = set()
+_UNKNOWN_OWNER_LOGGED = set()
+_KAKERA_CD_LOGGED = set()
+_CLICKED_COMPONENTS = {}
+_LOGGED_DROPS = set()
+
+
+def _remember_set(bucket, key, limit=400):
+    """Добавляет key в set. True, если key ещё не было."""
+    if key in bucket:
+        return False
+    if len(bucket) > limit:
+        bucket.clear()
+    bucket.add(key)
+    return True
+
+
+def _clicked_components(message_id):
+    mid = str(message_id)
+    bucket = _CLICKED_COMPONENTS.get(mid)
+    if bucket is None:
+        if len(_CLICKED_COMPONENTS) > 300:
+            _CLICKED_COMPONENTS.clear()
+        bucket = set()
+        _CLICKED_COMPONENTS[mid] = bucket
+    return bucket
+
+
+def _interaction_user_id(message):
+    """Id пользователя, который вызвал слэш-команду Mudae."""
+    for key in ('interaction_metadata', 'interaction'):
+        block = message.get(key) or {}
+        if not isinstance(block, dict):
+            continue
+        user = block.get('user') or {}
+        if not user and isinstance(block.get('member'), dict):
+            user = (block.get('member') or {}).get('user') or {}
+        uid = str(user.get('id') or block.get('user_id') or '')
+        if uid:
+            return uid
+    return ''
+
+
+def _message_text_blob(message):
+    parts = [message.get('content') or '']
+    for embed in message.get('embeds') or []:
+        if not isinstance(embed, dict):
+            continue
+        parts.append(embed.get('description') or '')
+        parts.append(embed.get('title') or '')
+        parts.append((embed.get('author') or {}).get('name') or '')
+        parts.append((embed.get('footer') or {}).get('text') or '')
+    return '\n'.join(parts)
+
+
+def _classify_roll_owner_fresh(message):
+    """'ours' / 'other' / 'unknown' по этому payload, без кэша."""
+    our = _our_user_id()
+    uid = _interaction_user_id(message)
+    if uid and our:
+        return 'ours' if uid == our else 'other'
+
+    ref = message.get('referenced_message') or {}
+    if isinstance(ref, dict):
+        ref_author = str((ref.get('author') or {}).get('id') or '')
+        if ref_author and our and ref_author == our:
+            return 'ours'
+        if ref_author and our:
+            return 'other'
+
+    blob = _message_text_blob(message)
+    wish = re.search(r'wished\s+by\s+(.+)', blob, re.IGNORECASE)
+    if not wish:
+        return 'unknown'
+
+    tail = wish.group(1).splitlines()[0]
+    if our and (f'<@{our}>' in tail or f'<@!{our}>' in tail):
+        return 'ours'
+    if re.search(r'<@!?\d+>', tail):
+        return 'other'
+
+    who = re.sub(r'<@!?\d+>', '', tail)
+    who = re.sub(r'\(edited\).*', '', who, flags=re.IGNORECASE)
+    who = who.strip(' *@`_')
+    who_cf = who.casefold()
+    if not who_cf:
+        return 'unknown'
+    for name in _our_discord_names():
+        n = (name or '').casefold()
+        if n and (who_cf == n or who_cf.startswith(n + ' ')):
+            return 'ours'
+    return 'other'
+
+
+def classify_roll_owner(message):
+    """Чей ролл. Правка сообщения наследует решение с первого события."""
+    mid = str(message.get('id') or '')
+    fresh = _classify_roll_owner_fresh(message)
+    if fresh in ('ours', 'other') and mid:
+        _OWNER_BY_MESSAGE[mid] = fresh
+        if len(_OWNER_BY_MESSAGE) > 500:
+            _OWNER_BY_MESSAGE.clear()
+            _OWNER_BY_MESSAGE[mid] = fresh
+        return fresh
+    if mid and mid in _OWNER_BY_MESSAGE:
+        return _OWNER_BY_MESSAGE[mid]
+    return 'unknown'
+
+
+def _looks_like_card(message):
+    return bool(message.get('embeds') or message.get('components'))
+
+
+def _log_unknown_owner(message):
+    mid = str(message.get('id') or '')
+    if not mid or not _remember_set(_UNKNOWN_OWNER_LOGGED, mid):
+        return
+    log_msg(
+        'ROLL',
+        f"Не понял, чей ролл (нет interaction и Wished by), сообщение {mid} — не кликаю.",
+        dim=True,
+    )
+
+
+def begin_roll_session(profile_state, current_threshold, jackpot_threshold):
+    with _ROLL_LOCK:
+        _ROLL_SESSION['active'] = True
+        _ROLL_SESSION['limit_reached'] = False
+        _ROLL_SESSION['claim_spent'] = False
+        _ROLL_SESSION['claiming'] = False
+        _ROLL_SESSION['claim_buffer'] = []
+        _ROLL_SESSION['profile_state'] = profile_state
+        _ROLL_SESSION['current_threshold'] = float(current_threshold)
+        _ROLL_SESSION['jackpot_threshold'] = float(jackpot_threshold)
+        now = time.time()
+        _ROLL_SESSION['last_send_at'] = now
+        _ROLL_SESSION['last_event_at'] = now
+    WebDashboard.emit_buffer_clear()
+
+
+def end_roll_session():
+    with _ROLL_LOCK:
+        _ROLL_SESSION['active'] = False
+        _ROLL_SESSION['claim_buffer'] = []
+        _ROLL_SESSION['claiming'] = False
+    WebDashboard.emit_buffer_clear()
+
+
+def roll_session_limit_reached():
+    with _ROLL_LOCK:
+        return bool(_ROLL_SESSION['limit_reached'])
+
+
+def note_roll_sent():
+    with _ROLL_LOCK:
+        _ROLL_SESSION['last_send_at'] = time.time()
+
+
+def _session_profile():
+    return _ROLL_SESSION.get('profile_state') or PROFILE_STATE
+
+
+def _note_roll_event():
+    _ROLL_SESSION['last_event_at'] = time.time()
+
+
+def _drop_buffered_card(message_id):
+    mid = str(message_id)
+    removed = False
+    remaining = []
+    with _ROLL_LOCK:
+        kept = []
+        for card in _ROLL_SESSION['claim_buffer']:
+            if str(card.get('msg_id')) == mid:
+                removed = True
+                continue
+            kept.append(card)
+        _ROLL_SESSION['claim_buffer'] = kept
+        remaining = list(kept)
+    if not removed:
+        return
+    WebDashboard.emit_buffer_clear()
+    ttl = get_claim_ttl()
+    for card in remaining:
+        WebDashboard.emit_buffer_card({
+            'msg_id': card['msg_id'],
+            'power': card['power'],
+            'name': card['name'],
+            'series': card['series'],
+            'ttl_ms': ttl * 1000,
+            'claim_ttl': ttl,
+        })
+
+
+def _refresh_buffered_card(message):
+    mid = str(message.get('id') or '')
+    with _ROLL_LOCK:
+        for card in _ROLL_SESSION['claim_buffer']:
+            if str(card.get('msg_id')) == mid:
+                card['message'] = message
+                card['components'] = message.get('components')
+                return
+
+
+def _claim_from_session(message, reason, *, allow_rt, name, series, power, clear_buffer=False):
+    """Клейм своей карты. Если буфер уже клеймит, ждём его и потом решаем."""
+    deadline = time.monotonic() + 8
+    while True:
+        with _ROLL_LOCK:
+            if not _ROLL_SESSION['active']:
+                return False
+            if not _ROLL_SESSION['claiming']:
+                if _ROLL_SESSION['claim_spent'] and not allow_rt:
+                    return False
+                _ROLL_SESSION['claiming'] = True
+                profile = _session_profile()
+                if clear_buffer:
+                    _ROLL_SESSION['claim_buffer'] = []
+                break
+        if time.monotonic() > deadline:
+            return None
+        time.sleep(0.05)
+    if clear_buffer:
+        WebDashboard.emit_buffer_clear()
+    success = False
+    try:
+        success = _claim_card(
+            message.get('id'),
+            reason,
+            profile,
+            message=message,
+            components=message.get('components'),
+            card_name=name or '',
+            card_series=series or '',
+            card_power=power or 0,
+            allow_rt=allow_rt,
+        )
+    finally:
+        with _ROLL_LOCK:
+            _ROLL_SESSION['claiming'] = False
+            if success:
+                _ROLL_SESSION['claim_spent'] = True
+                _ROLL_SESSION['claim_buffer'] = []
+    if success:
+        WebDashboard.emit_buffer_clear()
+    return success
+
+
+def process_roll_claim_buffer(force=False):
+    """Клеймит лучшую карточку буфера, когда истекает TTL (или force)."""
+    with _ROLL_LOCK:
+        if not _ROLL_SESSION['active']:
+            return
+        if _ROLL_SESSION['claim_spent']:
+            dirty = bool(_ROLL_SESSION['claim_buffer'])
+            _ROLL_SESSION['claim_buffer'] = []
+            best = None
+            should_clear = dirty
+        elif not _ROLL_SESSION['claim_buffer']:
+            return
+        elif _ROLL_SESSION['claiming']:
+            return
+        else:
+            should_clear = False
+            elapsed = time.time() - _ROLL_SESSION['claim_buffer'][0]['timestamp']
+            claim_ttl = get_claim_ttl()
+            if not force and elapsed < claim_ttl:
+                return
+            best = max(_ROLL_SESSION['claim_buffer'], key=lambda card: card['power'])
+            trigger = "достигнут лимит роллов" if force else f"сработал таймер {claim_ttl} сек"
+            size = len(_ROLL_SESSION['claim_buffer'])
+            _ROLL_SESSION['claiming'] = True
+            profile = _session_profile()
+            _ROLL_SESSION['claim_buffer'] = []
+    if best is None:
+        if should_clear:
+            WebDashboard.emit_buffer_clear()
+        return
+
+    WebDashboard.emit_buffer_clear()
+    log_msg(
+        'CLAIM',
+        f"Буфер: {trigger}; старшей карте {elapsed:.1f} сек. "
+        f"Выбрана лучшая карта (цена персонажа {best['power']}) из {size}.",
+    )
+    success = False
+    try:
+        success = _claim_card(
+            best['msg_id'],
+            f"снайпинг из буфера (цена {best['power']})",
+            profile,
+            message=best.get('message'),
+            components=best.get('components'),
+            card_name=best.get('name') or '',
+            card_series=best.get('series') or '',
+            card_power=best.get('power') or 0,
+        )
+    finally:
+        with _ROLL_LOCK:
+            _ROLL_SESSION['claiming'] = False
+            if success:
+                _ROLL_SESSION['claim_spent'] = True
+
+
+def _buffer_own_card(message, name, series, power, threshold):
+    with _ROLL_LOCK:
+        if not _ROLL_SESSION['active'] or _ROLL_SESSION['claim_spent']:
+            return False
+        mid = str(message.get('id'))
+        if any(str(card.get('msg_id')) == mid for card in _ROLL_SESSION['claim_buffer']):
+            return False
+        _ROLL_SESSION['claim_buffer'].append({
+            'msg_id': message.get('id'),
+            'power': power,
+            'name': name,
+            'series': series,
+            'timestamp': time.time(),
+            'message': message,
+            'components': message.get('components'),
+        })
+        size = len(_ROLL_SESSION['claim_buffer'])
+    ttl = get_claim_ttl()
+    WebDashboard.emit_buffer_card({
+        'msg_id': message.get('id'),
+        'power': power,
+        'name': name,
+        'series': series,
+        'ttl_ms': ttl * 1000,
+        'claim_ttl': ttl,
+    })
+    log_msg(
+        'CLAIM',
+        f"Карта (цена персонажа {power}) добавлена в буфер "
+        f"(порог {threshold:g}, размер: {size}).",
+    )
+    return True
+
+
+def _consider_own_claim(message):
+    """Клейм своей карты: в сессии — буфер, вне сессии — сразу по порогу."""
+    embeds = message.get('embeds') or []
+    if not embeds:
+        return
+    mid = str(message.get('id') or '')
+    embed = embeds[0]
+    name, series, power, is_claimed = parse_card_embed(embed)
+    if mid and _remember_set(_LOGGED_DROPS, mid):
+        _drop_log(name, series, power, is_claimed, message_id=message.get('id'))
+        apply_key_kakera_bonus(embed, message_id=message.get('id'))
+
+    if is_claimed:
+        _drop_buffered_card(mid)
+        _remember_set(_CLAIM_DECIDED, mid)
+        return
+
+    _refresh_buffered_card(message)
+    if mid and mid in _CLAIM_DECIDED:
+        return
+
+    with _ROLL_LOCK:
+        active = _ROLL_SESSION['active']
+        claim_spent = _ROLL_SESSION['claim_spent']
+        threshold = float(_ROLL_SESSION['current_threshold'] or 0)
+        jackpot_threshold = float(_ROLL_SESSION['jackpot_threshold'] or 0)
+        profile = _session_profile()
+
+    if not active:
+        profile = PROFILE_STATE
+        threshold = PROFILE_STATE.get('current_threshold')
+        if threshold is None:
+            threshold = compute_claim_threshold(PROFILE_STATE.get('claim_minutes_left', 0))
+        threshold = float(threshold)
+        jackpot_threshold = max(
+            float(Vars.min_power_threshold) * float(getattr(Vars, 'jackpot_multiplier', 3)),
+            threshold * float(getattr(Vars, 'jackpot_threshold_factor', 1.5)),
+        )
+        if power >= jackpot_threshold:
+            _claim_card(
+                message.get('id'),
+                f"джекпот цена {power} >= {jackpot_threshold:g}",
+                profile,
+                message=message,
+                card_name=name,
+                card_series=series,
+                card_power=power,
+                allow_rt=True,
+            )
+        elif series in Vars.desiredSeries:
+            _claim_card(
+                message.get('id'),
+                f"совпадение по серии: '{series}'",
+                profile,
+                message=message,
+                card_name=name,
+                card_series=series,
+                card_power=power,
+            )
+        elif power >= threshold:
+            _claim_card(
+                message.get('id'),
+                f"своя карта цена {power} >= {threshold:g}",
+                profile,
+                message=message,
+                card_name=name,
+                card_series=series,
+                card_power=power,
+            )
+        if mid:
+            _remember_set(_CLAIM_DECIDED, mid)
+        return
+
+    if power >= jackpot_threshold:
+        result = _claim_from_session(
+            message,
+            f"джекпот цена {power} >= {jackpot_threshold:g}",
+            allow_rt=True,
+            name=name,
+            series=series,
+            power=power,
+            clear_buffer=True,
+        )
+        if result is None:
+            return
+        if mid:
+            _remember_set(_CLAIM_DECIDED, mid)
+        return
+    if claim_spent:
+        if mid:
+            _remember_set(_CLAIM_DECIDED, mid)
+        return
+    if series in Vars.desiredSeries:
+        result = _claim_from_session(
+            message,
+            f"совпадение по серии: '{series}'",
+            allow_rt=False,
+            name=name,
+            series=series,
+            power=power,
+            clear_buffer=True,
+        )
+        if result is None:
+            return
+        if mid:
+            _remember_set(_CLAIM_DECIDED, mid)
+        return
+    if power >= threshold:
+        _buffer_own_card(message, name, series, power, threshold)
+    if mid:
+        _remember_set(_CLAIM_DECIDED, mid)
+
+
+def click_card_loot(message, *, log_prefix='Найдена кнопка какеры'):
+    """Какера из Vars.desiredKakeras и ourosphere. Повторный клик той же кнопки не шлём."""
+    if not message or not message.get('id'):
+        return 0
+    if kakera_on_cooldown() and message.get('components'):
+        mid = str(message['id'])
+        if _remember_set(_KAKERA_CD_LOGGED, mid):
+            log_msg(
+                'KAKER',
+                f"Какера в КД ещё {kakera_cooldown_left_seconds()} сек — "
+                f"проверяю только ourosphere.",
+                dim=True,
+            )
+    return click_desired_kakera(
+        message,
+        log_prefix=log_prefix,
+        clicked_ids=_clicked_components(message['id']),
+        wait_for_buttons=False,
+    )
+
+
+def on_mudae_gateway_message(message, *, is_update=False):
+    """Своя карточка с Gateway: клейм, какера, сфера. Чужие не трогает.
+
+    Возвращает 'ours' / 'other' / 'unknown'.
+    """
+    if not isinstance(message, dict):
+        return 'unknown'
+
+    owner = classify_roll_owner(message)
+    content = message.get('content') or ''
+    channel_id = str(message.get('channel_id') or '')
+    with _ROLL_LOCK:
+        active = _ROLL_SESSION['active']
+
+    limit_text = 'the roulette is limited to' in content.lower()
+    if limit_text and (
+        owner == 'ours'
+        or (
+            owner == 'unknown'
+            and active
+            and channel_id == str(Vars.channelId)
+        )
+    ):
+        with _ROLL_LOCK:
+            _ROLL_SESSION['limit_reached'] = True
+            profile = _session_profile()
+            if profile is not None:
+                profile['rolls_left'] = 0
+        log_msg('WARN', "Mudae сообщила о лимите прокрутов. Прокруты закончились!")
+        return 'ours'
+
+    if owner == 'unknown':
+        if _looks_like_card(message):
+            _log_unknown_owner(message)
+        return 'unknown'
+    if owner != 'ours':
+        return owner
+
+    with _ROLL_LOCK:
+        _note_roll_event()
+
+    if not is_update or message.get('embeds'):
+        _consider_own_claim(message)
+    elif is_update:
+        _refresh_buffered_card(message)
+
+    if message.get('components') or message.get('embeds'):
+        click_card_loot(message)
+    return 'ours'
+
+
+def _settle_roll_session():
+    """Ждёт последние карточки и TTL буфера после того, как команды уже отправлены."""
+    grace = 4.0
+    deadline = time.monotonic() + get_claim_ttl() + grace
+    while time.monotonic() < deadline:
+        if roll_session_limit_reached():
+            process_roll_claim_buffer(force=True)
+            break
+        process_roll_claim_buffer(force=False)
+        with _ROLL_LOCK:
+            spent = _ROLL_SESSION['claim_spent']
+            pending = bool(_ROLL_SESSION['claim_buffer'])
+            last = max(_ROLL_SESSION['last_send_at'], _ROLL_SESSION['last_event_at'])
+        if (spent or not pending) and time.time() - last >= grace:
+            break
+        time.sleep(0.25)
+    else:
+        process_roll_claim_buffer(force=True)
+
+
 def simpleRoll():
     global LAST_OUR_ROLL_TIME
     set_rolling(True)
@@ -1604,6 +2241,12 @@ def simpleRoll():
 
 def _simpleRoll_body():
     global LAST_OUR_ROLL_TIME
+    if not GATEWAY_LISTENING.wait(timeout=12):
+        log_msg(
+            'WARN',
+            "Gateway ещё не слушает канал. Команды отправлю, но карточки могу пропустить.",
+        )
+
     profile_state = updateProfileState()
     if profile_state is None:
         # При отсутствии ответа $tu не рискуем клеймом и используем базовый порог.
@@ -1625,7 +2268,6 @@ def _simpleRoll_body():
         f"(до сброса клейма: {claim_minutes_left} мин, rt_ready: {rt_ready})"
     )
 
-    # Динамическая формула джекпота (защищена от пересечения с текущим порогом)
     jackpot_threshold = max(
         float(Vars.min_power_threshold) * float(getattr(Vars, 'jackpot_multiplier', 3)),
         current_threshold * float(getattr(Vars, 'jackpot_threshold_factor', 1.5)),
@@ -1644,186 +2286,46 @@ def _simpleRoll_body():
             _send_pokeslot()
         return
 
-    limit_reached = False
+    begin_roll_session(profile_state, current_threshold, jackpot_threshold)
     rolls_done = 0
-    claim_buffer = []
-    claim_spent = False
-
-    def process_claim_buffer(force=False):
-        """Клеймит лучшую карточку в буфере, когда истекает её безопасный TTL."""
-        nonlocal claim_spent
-        if claim_spent:
-            claim_buffer.clear()
-            WebDashboard.emit_buffer_clear()
-            return
-        if not claim_buffer:
-            return
-
-        time_elapsed = time.time() - claim_buffer[0]['timestamp']
-        claim_ttl = get_claim_ttl()
-        if not force and time_elapsed < claim_ttl:
-            return
-
-        trigger = "достигнут лимит роллов" if force else f"сработал таймер {claim_ttl} сек"
-        best_card = max(claim_buffer, key=lambda card: card['power'])
-        log_msg('CLAIM',
-            f"Буфер: {trigger}; старшей карте {time_elapsed:.1f} сек. "
-            f"Выбрана лучшая карта (цена персонажа {best_card['power']}) "
-            f"из {len(claim_buffer)}."
-        )
-        claim_spent = _claim_card(
-            best_card['msg_id'],
-            f"снайпинг из буфера (цена {best_card['power']})",
-            profile_state,
-            message=best_card.get('message'),
-            components=best_card.get('components'),
-            card_name=best_card.get('name') or '',
-            card_series=best_card.get('series') or '',
-            card_power=best_card.get('power') or 0,
-        )
-        claim_buffer.clear()
-        WebDashboard.emit_buffer_clear()
-
-    # ИЗМЕНЕНИЕ ЗДЕСЬ: лимит-предохранитель сессии роллов
     max_rolls = int(getattr(Vars, 'max_rolls_per_session', 150))
-    while not limit_reached and rolls_done < max_rolls:
-        process_claim_buffer()
+    log_msg(
+        'ROLL',
+        "Канал слушаю через Gateway. Здесь только отправка команд, "
+        "клики по своим роллам — сразу по событию.",
+        dim=True,
+    )
+    try:
+        while rolls_done < max_rolls:
+            if roll_session_limit_reached():
+                process_roll_claim_buffer(force=True)
+                if _try_use_rolls(profile_state, context='лимит в сессии'):
+                    with _ROLL_LOCK:
+                        _ROLL_SESSION['limit_reached'] = False
+                    log_msg('ROLL', "Продолжаю сессию после $rolls.")
+                    continue
+                break
 
-        # 1. Получаем ID самого свежего сообщения ДО прокрута
-        last_msg_id = 0
-        r_before = requests.get(f"{url}?limit=1", headers=auth)
-        if r_before.status_code == 200 and len(r_before.json()) > 0:
-            last_msg_id = int(r_before.json()[0]['id'])
+            process_roll_claim_buffer(force=False)
+            log_msg('ROLL', f"#{rolls_done + 1}: отправляю Slash-команду прокрута...", dim=True)
+            action_pause()
+            LAST_OUR_ROLL_TIME = time.time()
+            try:
+                bot.triggerSlashCommand(
+                    botID, Vars.channelId, Vars.serverId, data=rollCommand,
+                )
+            except Exception as error:
+                log_msg('WARN', f"Не удалось отправить прокрут: {error}")
+                break
+            rolls_done += 1
+            note_roll_sent()
+            roll_pause()
 
-        # 2. Отправляем команду прокрута
-        log_msg('ROLL', f"#{rolls_done + 1}: отправляю Slash-команду прокрута...", dim=True)
-        action_pause()
-        LAST_OUR_ROLL_TIME = time.time()
-        bot.triggerSlashCommand(botID, Vars.channelId, Vars.serverId, data=rollCommand)
-        
-        # 3. Активный поллинг (Безопасное ожидание)
-        mudae_msg = None
-        attempts = 0
-        
-        while attempts < 4:  # ~3–5 сек с джиттером
-            human_sleep(0.7, 1.15)
+        _settle_roll_session()
+    finally:
+        end_roll_session()
 
-            # Запрашиваем только новые сообщения, появившиеся после last_msg_id
-            r = requests.get(f"{url}?after={last_msg_id}&limit=5", headers=auth)
-            
-            if r.status_code == 200:
-                messages = r.json()
-                mudae_msg = next((m for m in messages if m.get('author', {}).get('id') == botID), None)
-                
-                if mudae_msg:
-                    break # Сообщение найдено, выходим из ожидания
-            elif r.status_code == 429:
-                wait_time = r.json().get('retry_after', 1.0)
-                log_msg('WARN', f"Discord просит притормозить (Rate Limit). Ждем {wait_time} сек...")
-                time.sleep(wait_time)
-            
-            attempts += 1
+    log_msg('ROLL', f"Сессия прокрутов завершена. Отправлено команд: {rolls_done}")
 
-        # 4. Проверяем, ответила ли Mudae вообще
-        if not mudae_msg:
-            log_msg('WARN', "Mudae не ответила за 4 секунды (возможно лаг). Идем дальше.")
-            process_claim_buffer()
-            continue
-
-        # ПРОВЕРКА НА ЛИМИТ ПРОКРУТОВ / чат-события
-        msg_content = mudae_msg.get('content', '')
-        handle_mudae_chat(msg_content, message_id=mudae_msg.get('id'))
-        if "the roulette is limited to" in msg_content.lower():
-            log_msg('WARN', "Mudae сообщила о лимите прокрутов. Прокруты закончились!")
-            profile_state['rolls_left'] = 0
-            process_claim_buffer(force=True)
-            if _try_use_rolls(profile_state, context='лимит в сессии'):
-                log_msg('ROLL', "Продолжаю сессию после $rolls.")
-                continue
-            limit_reached = True
-            break
-
-        # РАБОТА С КАРТОЧКОЙ (EMBED)
-        embeds = mudae_msg.get('embeds', [])
-        if not embeds:
-            process_claim_buffer()
-            continue
-
-        embed = embeds[0]
-        cardName, cardSeries, cardPower, is_claimed = parse_card_embed(embed)
-
-        _drop_log(cardName, cardSeries, cardPower, is_claimed, message_id=mudae_msg.get('id'))
-        apply_key_kakera_bonus(embed, message_id=mudae_msg.get('id'))
-
-        # ЛОГИКА КЛЕЙМА И ОТЛОЖЕННОГО СНАПИНГА
-        # Джекпот проверяем даже после обычного клейма: тогда тратим $rt.
-        # claim_spent не должен глушить эту ветку — иначе джекпот просто игнорируется.
-        if not is_claimed:
-            is_jackpot = cardPower >= jackpot_threshold
-            if is_jackpot:
-                if _claim_card(
-                    mudae_msg['id'],
-                    f"джекпот цена {cardPower} >= {jackpot_threshold:g}",
-                    profile_state,
-                    message=mudae_msg,
-                    card_name=cardName,
-                    card_series=cardSeries,
-                    card_power=cardPower,
-                    allow_rt=True,
-                ):
-                    claim_spent = True
-            elif not claim_spent:
-                if cardSeries in Vars.desiredSeries:
-                    claim_spent = _claim_card(
-                        mudae_msg['id'],
-                        f"совпадение по серии: '{cardSeries}'",
-                        profile_state,
-                        message=mudae_msg,
-                        card_name=cardName,
-                        card_series=cardSeries,
-                        card_power=cardPower,
-                    )
-                elif cardPower >= current_threshold:
-                    claim_buffer.append({
-                        'msg_id': mudae_msg['id'],
-                        'power': cardPower,
-                        'name': cardName,
-                        'series': cardSeries,
-                        'timestamp': time.time(),
-                        'message': mudae_msg,
-                        'components': mudae_msg.get('components'),
-                    })
-                    ttl = get_claim_ttl()
-                    WebDashboard.emit_buffer_card({
-                        'msg_id': mudae_msg['id'],
-                        'power': cardPower,
-                        'name': cardName,
-                        'series': cardSeries,
-                        'ttl_ms': ttl * 1000,
-                        'claim_ttl': ttl,
-                    })
-                    log_msg('CLAIM',
-                        f"Карта (цена персонажа {cardPower}) добавлена в буфер "
-                        f"(порог {current_threshold:g}, размер: {len(claim_buffer)})."
-                    )
-
-        # ЛОГИКА КАКЕРЫ — клик по свежим custom_id; КД/начисления ловим из чата
-        mudae_msg = _refresh_kakera_message(mudae_msg)
-        if not kakera_on_cooldown():
-            click_desired_kakera(mudae_msg)
-        elif mudae_msg.get('components'):
-            log_msg(
-                'KAKER',
-                f"Пропуск какеры: КД ещё {kakera_cooldown_left_seconds()} сек.",
-                dim=True,
-            )
-
-        rolls_done += 1
-        process_claim_buffer()
-        roll_pause()
-
-    log_msg('ROLL', f"Сессия прокрутов завершена. Сделано роллов: {rolls_done}")
-
-    # ЛОГИКА POKESLOT
     if getattr(Vars, 'pokeRoll', False):
         _send_pokeslot()

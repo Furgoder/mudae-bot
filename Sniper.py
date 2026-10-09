@@ -9,17 +9,14 @@ from Function import (
     botID,
     log_msg,
     handle_mudae_chat,
-    _drop_log,
     parse_card_embed,
-    kakera_on_cooldown,
-    kakera_cooldown_left_seconds,
-    click_desired_kakera,
+    click_card_loot,
     human_sleep,
+    on_mudae_gateway_message,
+    _remember_set,
+    _CLAIM_DECIDED,
+    _drop_log,
 )
-
-def _our_roll_ignore_window():
-    return float(getattr(Vars, 'snipe_roll_ignore_window', 2.5))
-
 
 def _watch_channel_ids():
     """Каналы для парсинга чата Mudae: основной + снайп."""
@@ -64,16 +61,8 @@ def _claim_reaction(channel_id, message_id, message=None, allow_rt=False):
 
 
 def _snipe_kakera(message):
-    """Жмёт кнопки какеры на чужих роллах (если нет КД)."""
-    if kakera_on_cooldown():
-        log_msg(
-            'KAKER',
-            f"Снайп какеры пропущен: КД ещё {kakera_cooldown_left_seconds()} сек.",
-            dim=True,
-        )
-        return
-
-    click_desired_kakera(message, log_prefix='СНАЙП КАКЕРЫ')
+    """Жмёт какеру и ourosphere на чужих роллах. Сфера не зависит от КД какеры."""
+    click_card_loot(message, log_prefix='СНАЙП КАКЕРЫ')
 
 
 def _safe_subscribe_guild_events():
@@ -122,6 +111,7 @@ def _safe_subscribe_guild_events():
                     bot.gateway.subscribeToGuildEvents(onlyLarge=False, wait=0.25)
                 except Exception as error:
                     log_msg('WARN', f"subscribeToGuildEvents: {error}", dim=True)
+            Function.GATEWAY_LISTENING.set()
             return
         except Exception as error:
             log_msg(
@@ -135,6 +125,7 @@ def _safe_subscribe_guild_events():
         'WARN',
         "Не удалось отправить lazyGuild — сообщения из больших серверов могут не приходить.",
     )
+    Function.GATEWAY_LISTENING.set()
 
 
 @bot.gateway.command
@@ -172,20 +163,25 @@ def sniper(resp):
     # Реактивный парсер подтверждений (пока Gateway жив)
     handle_mudae_chat(message.get('content', ''), message_id=message.get('id'))
 
+    is_update = bool(resp.event.message_updated)
+    try:
+        owner = on_mudae_gateway_message(message, is_update=is_update)
+    except Exception as error:
+        log_msg('WARN', f"Ошибка разбора сообщения Mudae: {error}")
+        return
+
+    # Свои роллы уже разобраны. Чужие — только если снайпер включён на этом канале.
+    if owner != 'other':
+        return
     if not getattr(Vars, 'snipeEnabled', False):
         return
-
     if channel_id not in _snipe_ids():
-        return
-
-    # Свой ролл из simpleRoll — не перехватываем карту
-    if time.time() - Function.LAST_OUR_ROLL_TIME < _our_roll_ignore_window():
         return
 
     embeds = message.get('embeds') or []
     components = message.get('components') or []
 
-    if components:
+    if components or embeds:
         _snipe_kakera(message)
 
     if not embeds:
@@ -194,12 +190,18 @@ def sniper(resp):
     embed = embeds[0]
     card_name, card_series, card_power, is_claimed = parse_card_embed(embed)
 
+    message_id = message.get('id')
+    if not message_id:
+        return
+    if not _remember_set(_CLAIM_DECIDED, str(message_id)):
+        return
+
     _drop_log(
         card_name,
         card_series,
         card_power,
         is_claimed,
-        message_id=message.get('id'),
+        message_id=message_id,
     )
     if is_claimed:
         return
@@ -208,24 +210,18 @@ def sniper(resp):
     jackpot_threshold = float(Vars.min_power_threshold) * float(
         getattr(Vars, 'jackpot_multiplier', 3)
     )
-    # Ценная карта: серия ИЛИ цена >= текущего порога (не только джекпот!)
     valuable = (
         card_series in Vars.desiredSeries
         or card_power >= threshold
         or card_power >= jackpot_threshold
     )
     if not valuable:
-        # Лог только для «почти ценных», чтобы не спамить чат
         if card_power >= float(Vars.min_power_threshold) * 0.75:
             log_msg(
                 'CLAIM',
                 f"Снайп пропуск: {card_name} цена {card_power} < порог {threshold:g}.",
                 dim=True,
             )
-        return
-
-    message_id = message.get('id')
-    if not message_id:
         return
 
     log_msg(
@@ -235,7 +231,6 @@ def sniper(resp):
         dim=False,
     )
 
-    # Небольшая «реакция человека», без большого риска потерять карту
     human_sleep(0.2, 0.65)
     _claim_reaction(
         channel_id,

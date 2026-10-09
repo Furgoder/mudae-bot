@@ -22,7 +22,8 @@ ouroMinigamesEnabled = True
 
 # --- Роллы и клейм ---
 rollCommand = 'mx'
-desiredKakeras = ['kakeraP', 'kakeraY', 'kakeraO', 'kakeraR', 'kakeraW', 'kakeraL', 'kakeraD', 'kakeraC']
+# Бот жмёт только имена из этого списка. kakeraY — золотая.
+desiredKakeras = ['kakera', 'kakeraP', 'kakeraT', 'kakeraG', 'kakeraY', 'kakeraO', 'kakeraR', 'kakeraW', 'kakeraL', 'kakeraD', 'kakeraC']
 desiredSeries = []
 min_power_threshold = 80
 pokeRoll = False
