@@ -1417,15 +1417,10 @@ def click_desired_kakera(
 
         emoji, button = targets[0]
         custom_id = button.get('custom_id')
+        # Резервируем id до запроса, чтобы параллельный проход не взял ту же кнопку.
+        clicked_ids.add(custom_id)
         remaining = len(targets)
-        loot_label = 'ourosphere' if _is_ourosphere_name(emoji) else 'какеру'
-        log_msg(
-            'KAKER',
-            f"{log_prefix}: {emoji}. "
-            f"Пытаюсь взять {loot_label} №{clicks + 1} "
-            f"(осталось на карте: {remaining})...",
-            dim=True,
-        )
+        shown = emoji if log_prefix == 'Найдена кнопка какеры' else f'{log_prefix}: {emoji}'
         try:
             human_sleep(0.08, 0.18, kind='kakera', log=False)
             response = bot.click(
@@ -1443,8 +1438,12 @@ def click_desired_kakera(
                 message = _refresh_kakera_message(message)
                 continue
             clicks += 1
-            clicked_ids.add(custom_id)
-            log_msg('KAKER', f"Нажатие на {emoji} отправлено.")
+            log_msg(
+                'KAKER',
+                f"{shown}: клик отправлен"
+                + (f", ещё {remaining - 1}." if remaining > 1 else "."),
+                dim=True,
+            )
         except Exception as error:
             log_msg('WARN', f"Ошибка нажатия: {error}")
             clicked_ids.add(custom_id)
@@ -2136,12 +2135,24 @@ def _consider_own_claim(message):
         _remember_set(_CLAIM_DECIDED, mid)
 
 
+_LOOT_GUARD = threading.Lock()
+_LOOT_ACTIVE = set()
+
+
 def click_card_loot(message, *, log_prefix='Найдена кнопка какеры'):
-    """Какера из Vars.desiredKakeras и ourosphere. Повторный клик той же кнопки не шлём."""
+    """Какера из Vars.desiredKakeras и ourosphere. Повторный клик той же кнопки не шлём.
+
+    CREATE и UPDATE одной карточки часто приходят вместе. Второй заход
+    пропускаем, пока первый проход ещё жмёт кнопки.
+    """
     if not message or not message.get('id'):
         return 0
+    mid = str(message['id'])
+    with _LOOT_GUARD:
+        if mid in _LOOT_ACTIVE:
+            return 0
+        _LOOT_ACTIVE.add(mid)
     if kakera_on_cooldown() and message.get('components'):
-        mid = str(message['id'])
         if _remember_set(_KAKERA_CD_LOGGED, mid):
             log_msg(
                 'KAKER',
@@ -2149,12 +2160,16 @@ def click_card_loot(message, *, log_prefix='Найдена кнопка каке
                 f"проверяю только ourosphere.",
                 dim=True,
             )
-    return click_desired_kakera(
-        message,
-        log_prefix=log_prefix,
-        clicked_ids=_clicked_components(message['id']),
-        wait_for_buttons=False,
-    )
+    try:
+        return click_desired_kakera(
+            message,
+            log_prefix=log_prefix,
+            clicked_ids=_clicked_components(mid),
+            wait_for_buttons=False,
+        )
+    finally:
+        with _LOOT_GUARD:
+            _LOOT_ACTIVE.discard(mid)
 
 
 def on_mudae_gateway_message(message, *, is_update=False):
