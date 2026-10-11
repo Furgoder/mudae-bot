@@ -152,6 +152,8 @@ def sniper(resp):
     else:
         message = resp.raw.get('d') or {}
 
+    message = Function.remember_gateway_message(message)
+
     author = message.get('author') or {}
     if str(author.get('id', '')) != str(botID):
         return

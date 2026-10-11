@@ -247,6 +247,8 @@ def kakera_cooldown_left_seconds():
 
 # Ожидающий клейм (карточка до подтверждения «married»)
 _PENDING_CLAIM = None
+# Последняя наша свадьба. Gateway часто разбирает её раньше, чем опрос после клика.
+_LAST_OUR_MARRIAGE = {'at': 0.0, 'name': ''}
 
 
 def note_pending_claim(*, name='', series='', power=0, reason=''):
@@ -471,6 +473,20 @@ def handle_mudae_chat(content, message_id=None):
                 return None
         if not _once('marriage'):
             return None
+
+        global _LAST_OUR_MARRIAGE
+        _LAST_OUR_MARRIAGE = {'at': time.time(), 'name': character}
+
+        profile = _session_profile()
+        if isinstance(profile, dict):
+            profile['can_claim'] = False
+        PROFILE_STATE['can_claim'] = False
+        sync_profile_state(PROFILE_STATE)
+        with _ROLL_LOCK:
+            if _ROLL_SESSION.get('active'):
+                _ROLL_SESSION['claim_spent'] = True
+                _ROLL_SESSION['claim_buffer'] = []
+        WebDashboard.emit_buffer_clear()
 
         amounts = [_parse_amount(x) for x in re.findall(r'\+(\d{1,3}(?:,\d{3})+|\d+)', parsed)]
         kakera_amount = amounts[0] if amounts else 0
@@ -1189,31 +1205,236 @@ def updateProfileState(_refreshed_after_dk=False, skip_actions=False):
 
     return state
 
-def _ensure_claim_ready(profile_state, allow_rt=False):
+_RT_FAIL_RE = re.compile(
+    r"cooldown of\s+\$?rt\b|can'?t use\s+\$?rt\b|\$rt\s+is\s+ready\s+in\b",
+    re.IGNORECASE,
+)
+_RT_OK_RE = re.compile(
+    r'claim (?:has been |was )?reset|reset(?:ting)? (?:your |the )?claim|'
+    r'you can claim right now|can now claim',
+    re.IGNORECASE,
+)
+_CANT_CLAIM_RE = re.compile(r"you can'?t claim\b", re.IGNORECASE)
+_CLAIM_CLICKS = {}
+
+
+def _ensure_claim_ready(profile_state, allow_rt=False, channel_id=None):
     """Проверяет доступность клейма.
 
-    $rt тратим только на джекпот: обычные карты при КД клейма пропускаем.
+    $rt тратим только на вишлист и джекпот. После команды ждём, пока Mudae
+    реально откроет клейм: клик в ту же секунду она отклоняет, а Discord
+    при этом уже ответил 204.
     """
     if profile_state.get('can_claim', False):
         return True
 
     if not allow_rt:
-        log_msg('WARN', "Клейм в откате. $rt бережём для джекпота — реакцию не отправляю.")
+        log_msg('WARN', "Клейм в откате. $rt бережём для вишлиста и джекпота — реакцию не отправляю.")
         return False
 
     if profile_state.get('rt_ready') is not True:
-        log_msg('WARN', "Джекпот, но клейм в откате и $rt недоступен. Реакция не отправлена.")
+        log_msg('WARN', "Вишлист/джекпот, но клейм в откате и $rt недоступен. Реакция не отправлена.")
         return False
 
-    log_msg('CLAIM', "Джекпот при КД клейма: $rt доступен, отправляю $rt перед клеймом.", dim=True)
-    if _send_text_command('$rt') in [200, 204]:
-        # Команда принята Discord; не отправляем второй $rt в этой сессии.
-        profile_state['can_claim'] = True
-        profile_state['rt_ready'] = False
-        sync_profile_state(profile_state)
-        return True
+    log_msg('CLAIM', "Клейм уже потрачен. $rt доступен — отправляю и жду сброс перед кнопкой.", dim=True)
+    after_id = _get_latest_message_id()
+    if _send_text_command('$rt') not in [200, 204]:
+        return False
 
-    return False
+    # Команда ушла в Discord. Второй $rt в этой попытке не шлём.
+    profile_state['rt_ready'] = False
+    sync_profile_state(profile_state)
+    applied = _wait_until_claim_reset(after_id, channel_id=channel_id)
+    if not applied:
+        profile_state['rt_ready'] = True
+        profile_state['can_claim'] = False
+        sync_profile_state(profile_state)
+        log_msg('WARN', "Mudae не сбросила клейм после $rt. Кнопку не жму.")
+        return False
+
+    profile_state['can_claim'] = True
+    sync_profile_state(profile_state)
+    return True
+
+
+def _fetch_new_mudae_texts(after_id, channel_id):
+    """Новые текстовые сообщения Mudae после after_id: (id, raw, normalized)."""
+    try:
+        response = requests.get(
+            f'https://discord.com/api/v9/channels/{channel_id}/messages'
+            f'?after={after_id}&limit=10',
+            headers=auth,
+            timeout=8,
+        )
+    except requests.RequestException:
+        return []
+    if response.status_code != 200:
+        return []
+
+    found = []
+    ordered = sorted(response.json() or [], key=lambda item: int(item.get('id') or 0))
+    for msg in ordered:
+        if str((msg.get('author') or {}).get('id', '')) != str(botID):
+            continue
+        mid = str(msg.get('id') or '')
+        raw = msg.get('content') or ''
+        if not raw and msg.get('embeds'):
+            raw = (msg['embeds'][0].get('description') or '')
+        found.append((mid, raw, _normalize_mudae_text(raw)))
+    return found
+
+
+def _wait_until_claim_reset(after_message_id, channel_id=None):
+    """True, если после $rt можно жать клейм. False — Mudae явно отказала."""
+    channel_id = channel_id or Vars.channelId
+    started = time.monotonic()
+    deadline = started + 4.5
+    last_id = str(after_message_id or 0)
+    while time.monotonic() < deadline:
+        human_sleep(0.35, 0.55, kind='action', log=False)
+        for mid, raw, text in _fetch_new_mudae_texts(last_id, channel_id):
+            if mid:
+                last_id = mid
+            if raw:
+                handle_mudae_chat(raw, message_id=mid)
+            if text and _RT_FAIL_RE.search(text):
+                return False
+            if text and _RT_OK_RE.search(text):
+                log_msg('CLAIM', "Mudae подтвердила сброс клейма после $rt.", dim=True)
+                human_sleep(0.3, 0.5, kind='action', log=False)
+                return True
+        if time.monotonic() - started >= 2.0:
+            log_msg('CLAIM', "Пауза после $rt прошла, жму кнопку клейма.", dim=True)
+            return True
+    return True
+
+
+def remember_gateway_message(message):
+    """Склеивает правку Discord с уже виденным сообщением.
+
+    MESSAGE_UPDATE часто приходит без author и без старых embeds.
+    Без склейки такой апдейт отбрасывается, и кнопка kakeraY не нажимается.
+    """
+    if not isinstance(message, dict):
+        return message
+    mid = str(message.get('id') or '')
+    if not mid:
+        return message
+    previous = _MESSAGE_CACHE.get(mid)
+    if previous:
+        merged = dict(previous)
+        for key, value in message.items():
+            if value is None:
+                continue
+            merged[key] = value
+        message = merged
+    _MESSAGE_CACHE[mid] = message
+    if len(_MESSAGE_CACHE) > 400:
+        for old in list(_MESSAGE_CACHE)[:200]:
+            _MESSAGE_CACHE.pop(old, None)
+    return message
+
+
+def _await_claim_button(message, message_id, channel_id, components, *, timeout=2.6):
+    """Ждёт кнопку сердца. $rt до этого не отправляем."""
+    msg = message if isinstance(message, dict) else None
+    resolved_channel = channel_id or Vars.channelId
+    if msg:
+        resolved_channel = msg.get('channel_id') or resolved_channel
+        message_id = msg.get('id') or message_id
+        if components is None:
+            components = msg.get('components')
+
+    deadline = time.monotonic() + timeout
+    while True:
+        button = find_claim_button(components)
+        if button and msg:
+            return msg, button, resolved_channel, message_id
+        if time.monotonic() >= deadline or not message_id:
+            return msg, None, resolved_channel, message_id
+        human_sleep(0.28, 0.45, kind='action', log=False)
+        fetched = _fetch_channel_message(resolved_channel, message_id, quiet=True)
+        if not fetched:
+            continue
+        msg = fetched
+        components = fetched.get('components')
+        resolved_channel = fetched.get('channel_id') or resolved_channel
+        message_id = fetched.get('id') or message_id
+        remember_gateway_message(fetched)
+
+
+def _claim_click_count(message_id):
+    mid = str(message_id or '')
+    count = _CLAIM_CLICKS.get(mid, 0) + 1
+    _CLAIM_CLICKS[mid] = count
+    if len(_CLAIM_CLICKS) > 400:
+        _CLAIM_CLICKS.clear()
+        _CLAIM_CLICKS[mid] = count
+    return count
+
+
+def _footer_owner_name(message):
+    embeds = (message or {}).get('embeds') or []
+    if not embeds:
+        return ''
+    footer = ((embeds[0].get('footer') or {}).get('text') or '')
+    match = re.search(r'belongs to\s+(.+)', footer, re.IGNORECASE)
+    return match.group(1).strip() if match else ''
+
+
+def _we_own_card(message):
+    owner = _footer_owner_name(message)
+    return bool(owner) and _is_our_name(owner)
+
+
+def _refresh_card_message(channel_id, message_id):
+    fetched = _fetch_channel_message(channel_id, message_id, quiet=True)
+    if fetched:
+        remember_gateway_message(fetched)
+    return fetched
+
+
+def _our_marriage_since(since):
+    """Свадьба уже разобрана (часто Gateway-потоком), а кнопка сердца ещё на месте."""
+    return float(_LAST_OUR_MARRIAGE.get('at') or 0) >= float(since or 0) - 0.5
+
+
+def _poll_claim_outcome(after_id, channel_id, message_id, *, since=None):
+    """'ok' — наш клейм прошёл. 'lost' — карту забрали не мы. 'rejected' — сердце ещё живо.
+
+    Сердце после свадьбы часто остаётся на карте. Это не отказ.
+    """
+    started = time.monotonic()
+    since = time.time() if since is None else since
+    last_id = str(after_id or 0)
+    while time.monotonic() - started < 2.4:
+        human_sleep(0.35, 0.5, kind='action', log=False)
+        if _our_marriage_since(since):
+            return 'ok'
+        for mid, raw, text in _fetch_new_mudae_texts(last_id, channel_id):
+            if mid:
+                last_id = mid
+            if raw:
+                event = handle_mudae_chat(raw, message_id=mid)
+                if event and event.get('type') == 'marriage':
+                    return 'ok'
+            if text and _CANT_CLAIM_RE.search(text):
+                return 'rejected'
+        if _our_marriage_since(since):
+            return 'ok'
+        fetched = _refresh_card_message(channel_id, message_id)
+        if fetched and _we_own_card(fetched):
+            return 'ok'
+        if fetched and _footer_owner_name(fetched) and not _we_own_card(fetched):
+            return 'lost'
+    if _our_marriage_since(since):
+        return 'ok'
+    fetched = _refresh_card_message(channel_id, message_id)
+    if fetched and _we_own_card(fetched):
+        return 'ok'
+    if fetched and _footer_owner_name(fetched):
+        return 'lost'
+    return 'rejected'
 
 
 _CLAIM_REACTION_EMOJI = "%F0%9F%A6%BF"  # 🦫 — старый fallback
@@ -1267,10 +1488,46 @@ OUROSPHERE_VALUES = {
 }
 _OUROSPHERE_VALUES_CF = {name.casefold(): value for name, value in OUROSPHERE_VALUES.items()}
 _KAKERA_VALUES_CF = {name.casefold(): value for name, value in KAKERA_VALUES.items()}
+_EMOJI_NAMES_BY_ID = {}
+
+
+def _learn_emoji_shortcodes(text):
+    for name, emoji_id in re.findall(r'<a?:(\w+):(\d+)>', text or ''):
+        _EMOJI_NAMES_BY_ID[emoji_id] = name
+
+
+def _log_unclicked_kakera(message):
+    """Если на карте была kakera, но имя кнопки не совпало со списком — пишем это один раз."""
+    mid = str((message or {}).get('id') or '')
+    if not mid or not _remember_set(_KAKERA_CD_LOGGED, f'names:{mid}'):
+        return
+    names = []
+    for button in _iter_message_buttons((message or {}).get('components')):
+        emoji = button.get('emoji') or {}
+        label = _button_emoji_name(button) or emoji.get('name') or ''
+        if not label and emoji.get('id'):
+            label = f"id:{emoji.get('id')}"
+        if label:
+            names.append(label)
+    interesting = [name for name in names if 'kakera' in name.lower() or name.startswith('id:')]
+    if not interesting:
+        return
+    log_msg(
+        'KAKER',
+        f"Кнопку какеры вижу, но не жму: {', '.join(interesting)}.",
+        dim=True,
+    )
 
 
 def _button_emoji_name(button):
-    return (button.get('emoji') or {}).get('name') or ''
+    emoji = button.get('emoji') or {}
+    name = emoji.get('name') or ''
+    emoji_id = str(emoji.get('id') or '')
+    if name and emoji_id:
+        _EMOJI_NAMES_BY_ID[emoji_id] = name
+    if not name and emoji_id:
+        name = _EMOJI_NAMES_BY_ID.get(emoji_id, '')
+    return name
 
 
 def _is_ourosphere_name(name):
@@ -1392,7 +1649,11 @@ def click_desired_kakera(
         message = _wait_kakera_buttons_ready(message)
     elif not _kakera_targets(message):
         message = _refresh_kakera_message(message)
+        if not _kakera_targets(message):
+            human_sleep(0.35, 0.55, kind='kakera', log=False)
+            message = _refresh_kakera_message(message)
     if not _kakera_targets(message):
+        _log_unclicked_kakera(message)
         return 0
 
     channel_id = message.get('channel_id') or Vars.channelId
@@ -1423,8 +1684,9 @@ def click_desired_kakera(
         shown = emoji if log_prefix == 'Найдена кнопка какеры' else f'{log_prefix}: {emoji}'
         try:
             human_sleep(0.08, 0.18, kind='kakera', log=False)
+            author_id = (message.get('author') or {}).get('id') or botID
             response = bot.click(
-                message['author']['id'],
+                author_id,
                 channelID=channel_id,
                 guildID=guild_id,
                 messageID=message['id'],
@@ -1592,8 +1854,35 @@ def _claim_card(
     components — можно передать отдельно, если message урезан.
     channel_id — канал сообщения (для снайпа / fallback).
     """
-    if not _ensure_claim_ready(profile_state, allow_rt=allow_rt):
+    resolved_channel = channel_id or Vars.channelId
+    if isinstance(message, dict):
+        resolved_channel = message.get('channel_id') or resolved_channel
+        message_id = message.get('id') or message_id
+
+    if message_id and _CLAIM_CLICKS.get(str(message_id), 0) >= 3:
+        log_msg('WARN', "Клейм этой карты уже пробовали несколько раз. Останавливаюсь.")
         return False
+
+    msg, claim_button, resolved_channel, message_id = _await_claim_button(
+        message, message_id, resolved_channel, components,
+    )
+    if not claim_button:
+        log_msg(
+            'WARN',
+            "Кнопка клейма ещё не появилась. $rt не трачу, дождусь правки сообщения.",
+        )
+        return None
+
+    if not _ensure_claim_ready(profile_state, allow_rt=allow_rt, channel_id=resolved_channel):
+        return False
+
+    # После $rt Mudae часто пересобирает кнопки — берём свежий custom_id.
+    msg, claim_button, resolved_channel, message_id = _await_claim_button(
+        msg, message_id, resolved_channel, None, timeout=1.6,
+    )
+    if not claim_button:
+        log_msg('WARN', "После $rt кнопка клейма пропала из сообщения. Повторю на следующей правке.")
+        return None
 
     name = card_name
     series = card_series
@@ -1619,39 +1908,51 @@ def _claim_card(
 
     log_msg('CLAIM', f"Причина клейма — {reason}. Пытаюсь заклеймить...", dim=True)
 
-    msg = message if isinstance(message, dict) else None
-    resolved_channel = channel_id or Vars.channelId
-    if msg:
-        resolved_channel = msg.get('channel_id') or resolved_channel
-        message_id = msg.get('id') or message_id
-        if components is None:
-            components = msg.get('components')
-
-    # Если components нет — подтянем свежее сообщение с API
-    if not components and message_id:
-        fetched = _fetch_channel_message(resolved_channel, message_id)
-        if fetched:
-            msg = fetched
-            components = fetched.get('components')
-            resolved_channel = fetched.get('channel_id') or resolved_channel
-
-    claim_button = find_claim_button(components)
-    success = False
-    if claim_button and msg:
-        success = _claim_via_button(msg, claim_button)
-        if not success:
-            log_msg('WARN', "Клик по кнопке клейма не удался — пробую реакцию.")
-            success = _claim_via_reaction(message_id, channel_id=resolved_channel)
-    else:
-        success = _claim_via_reaction(message_id, channel_id=resolved_channel)
-
-    if success:
-        log_msg('CLAIM', "УСПЕХ: Клейм принят Discord API.")
-        profile_state['can_claim'] = False
-        sync_profile_state(profile_state)
-        WebDashboard.emit_buffer_clear()
-        return True
-    return False
+    attempt_started = time.time()
+    while True:
+        if _our_marriage_since(attempt_started):
+            log_msg('CLAIM', "УСПЕХ: Mudae уже сообщила о свадьбе.")
+            profile_state['can_claim'] = False
+            sync_profile_state(profile_state)
+            WebDashboard.emit_buffer_clear()
+            return True
+        clicks = _claim_click_count(message_id)
+        after_click = _get_latest_message_id()
+        clicked = _claim_via_button(msg, claim_button)
+        outcome = 'rejected'
+        if clicked:
+            outcome = _poll_claim_outcome(
+                after_click, resolved_channel, message_id, since=attempt_started,
+            )
+        if outcome != 'ok' and _our_marriage_since(attempt_started):
+            outcome = 'ok'
+        if outcome == 'ok':
+            log_msg('CLAIM', "УСПЕХ: Mudae забрала персонажа.")
+            profile_state['can_claim'] = False
+            sync_profile_state(profile_state)
+            WebDashboard.emit_buffer_clear()
+            return True
+        if outcome == 'lost':
+            log_msg('WARN', "Персонажа уже забрал кто-то другой. Клейм не списываю.")
+            return False
+        if clicks >= 3:
+            log_msg('WARN', "Три клика по сердцу не заклеймили персонажа. Останавливаюсь.")
+            return False
+        log_msg('WARN', "Клейм не прошёл. Жду и жму сердце ещё раз.", dim=True)
+        human_sleep(0.7, 1.1, kind='action', log=False)
+        msg, claim_button, resolved_channel, message_id = _await_claim_button(
+            msg, message_id, resolved_channel, None, timeout=1.4,
+        )
+        if not claim_button:
+            fetched = _refresh_card_message(resolved_channel, message_id)
+            if _our_marriage_since(attempt_started) or (fetched and _we_own_card(fetched)):
+                log_msg('CLAIM', "УСПЕХ: Mudae забрала персонажа.")
+                profile_state['can_claim'] = False
+                sync_profile_state(profile_state)
+                WebDashboard.emit_buffer_clear()
+                return True
+            log_msg('WARN', "Кнопка клейма исчезла до подтверждения. Повторю, если сообщение ещё раз обновят.")
+            return None
 
 def _send_pokeslot():
     """Отправляет $p. Сбой сети не должен ронять поток расписания."""
@@ -1684,6 +1985,7 @@ _ROLL_SESSION = {
     'last_event_at': 0.0,
 }
 _OWNER_BY_MESSAGE = {}
+_MESSAGE_CACHE = {}
 _CLAIM_DECIDED = set()
 _UNKNOWN_OWNER_LOGGED = set()
 _KAKERA_CD_LOGGED = set()
@@ -1739,6 +2041,37 @@ def _message_text_blob(message):
     return '\n'.join(parts)
 
 
+def _wish_mention_owner(message):
+    """'ours' / 'other' / None по строке Wished by."""
+    blob = _message_text_blob(message) if isinstance(message, dict) else ''
+    wish = re.search(r'wished\s+by\s+(.+)', blob, re.IGNORECASE)
+    if not wish:
+        return None
+    tail = wish.group(1).splitlines()[0]
+    our = _our_user_id()
+    if our and (f'<@{our}>' in tail or f'<@!{our}>' in tail):
+        return 'ours'
+    if re.search(r'<@!?\d+>', tail):
+        return 'other'
+    who = re.sub(r'<@!?\d+>', '', tail)
+    who = re.sub(r'\(edited\).*', '', who, flags=re.IGNORECASE)
+    who = who.strip(' *@`_')
+    who_cf = who.casefold()
+    if not who_cf:
+        return None
+    for name in _our_discord_names():
+        n = (name or '').casefold()
+        if n and (who_cf == n or who_cf.startswith(n + ' ')):
+            return 'ours'
+    return 'other'
+
+
+def _priority_claim_reason(our_wish, name, power, jackpot_threshold):
+    if our_wish:
+        return f"наш вишлист: {name}"
+    return f"джекпот цена {power} >= {jackpot_threshold:g}"
+
+
 def _classify_roll_owner_fresh(message):
     """'ours' / 'other' / 'unknown' по этому payload, без кэша."""
     our = _our_user_id()
@@ -1755,27 +2088,8 @@ def _classify_roll_owner_fresh(message):
             return 'other'
 
     blob = _message_text_blob(message)
-    wish = re.search(r'wished\s+by\s+(.+)', blob, re.IGNORECASE)
-    if not wish:
-        return 'unknown'
-
-    tail = wish.group(1).splitlines()[0]
-    if our and (f'<@{our}>' in tail or f'<@!{our}>' in tail):
-        return 'ours'
-    if re.search(r'<@!?\d+>', tail):
-        return 'other'
-
-    who = re.sub(r'<@!?\d+>', '', tail)
-    who = re.sub(r'\(edited\).*', '', who, flags=re.IGNORECASE)
-    who = who.strip(' *@`_')
-    who_cf = who.casefold()
-    if not who_cf:
-        return 'unknown'
-    for name in _our_discord_names():
-        n = (name or '').casefold()
-        if n and (who_cf == n or who_cf.startswith(n + ' ')):
-            return 'ours'
-    return 'other'
+    _learn_emoji_shortcodes(blob)
+    return _wish_mention_owner(message) or 'unknown'
 
 
 def classify_roll_owner(message):
@@ -2050,6 +2364,8 @@ def _consider_own_claim(message):
         jackpot_threshold = float(_ROLL_SESSION['jackpot_threshold'] or 0)
         profile = _session_profile()
 
+    our_wish = _wish_mention_owner(message) == 'ours'
+
     if not active:
         profile = PROFILE_STATE
         threshold = PROFILE_STATE.get('current_threshold')
@@ -2060,10 +2376,13 @@ def _consider_own_claim(message):
             float(Vars.min_power_threshold) * float(getattr(Vars, 'jackpot_multiplier', 3)),
             threshold * float(getattr(Vars, 'jackpot_threshold_factor', 1.5)),
         )
-        if power >= jackpot_threshold:
-            _claim_card(
+        result = False
+        attempted = False
+        if our_wish or power >= jackpot_threshold:
+            attempted = True
+            result = _claim_card(
                 message.get('id'),
-                f"джекпот цена {power} >= {jackpot_threshold:g}",
+                _priority_claim_reason(our_wish, name, power, jackpot_threshold),
                 profile,
                 message=message,
                 card_name=name,
@@ -2072,7 +2391,8 @@ def _consider_own_claim(message):
                 allow_rt=True,
             )
         elif series in Vars.desiredSeries:
-            _claim_card(
+            attempted = True
+            result = _claim_card(
                 message.get('id'),
                 f"совпадение по серии: '{series}'",
                 profile,
@@ -2082,7 +2402,8 @@ def _consider_own_claim(message):
                 card_power=power,
             )
         elif power >= threshold:
-            _claim_card(
+            attempted = True
+            result = _claim_card(
                 message.get('id'),
                 f"своя карта цена {power} >= {threshold:g}",
                 profile,
@@ -2091,14 +2412,16 @@ def _consider_own_claim(message):
                 card_series=series,
                 card_power=power,
             )
+        if attempted and result is None:
+            return
         if mid:
             _remember_set(_CLAIM_DECIDED, mid)
         return
 
-    if power >= jackpot_threshold:
+    if our_wish or power >= jackpot_threshold:
         result = _claim_from_session(
             message,
-            f"джекпот цена {power} >= {jackpot_threshold:g}",
+            _priority_claim_reason(our_wish, name, power, jackpot_threshold),
             allow_rt=True,
             name=name,
             series=series,
@@ -2147,6 +2470,7 @@ def click_card_loot(message, *, log_prefix='Найдена кнопка каке
     """
     if not message or not message.get('id'):
         return 0
+    _learn_emoji_shortcodes(_message_text_blob(message))
     mid = str(message['id'])
     with _LOOT_GUARD:
         if mid in _LOOT_ACTIVE:
@@ -2179,6 +2503,7 @@ def on_mudae_gateway_message(message, *, is_update=False):
     """
     if not isinstance(message, dict):
         return 'unknown'
+    _learn_emoji_shortcodes(_message_text_blob(message))
 
     owner = classify_roll_owner(message)
     content = message.get('content') or ''
@@ -2206,6 +2531,19 @@ def on_mudae_gateway_message(message, *, is_update=False):
     if owner == 'unknown':
         if _looks_like_card(message):
             _log_unknown_owner(message)
+        recent_own_roll = (
+            active
+            and channel_id == str(Vars.channelId)
+            and (time.time() - LAST_OUR_ROLL_TIME) <= 6
+        )
+        if recent_own_roll and (message.get('components') or message.get('embeds')):
+            log_msg(
+                'KAKER',
+                "Владелец ролла не распознан, но команда только что наша — жму какеру.",
+                dim=True,
+            )
+            _learn_emoji_shortcodes(_message_text_blob(message))
+            click_card_loot(message)
         return 'unknown'
     if owner != 'ours':
         return owner
