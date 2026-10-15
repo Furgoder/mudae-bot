@@ -79,7 +79,8 @@ _SLEEP_KIND_LABELS = {
     'poll': 'ожидание ответа',
 }
 
-LOG_CACHE = deque(maxlen=200)
+LOG_CACHE = deque(maxlen=4000)
+_LOG_DIR = Path(__file__).resolve().parent / 'logs'
 
 
 def _load_claim_history():
@@ -442,10 +443,25 @@ def persist_var_to_file(key, value):
     return True
 
 
+def _append_log_file(payload):
+    """Дневной файл, чтобы рестарт и буфер панели не стирали историю."""
+    try:
+        _LOG_DIR.mkdir(exist_ok=True)
+        day = time.strftime('%Y-%m-%d')
+        path = _LOG_DIR / f'events-{day}.log'
+        line = f"[{payload.get('time', '')}] [{payload.get('tag', '')}] {payload.get('message', '')}\n"
+        with _log_lock:
+            with path.open('a', encoding='utf-8') as handle:
+                handle.write(line)
+    except OSError:
+        return
+
+
 def emit_log(payload):
-    """Кладёт лог в кэш и рассылает клиентам."""
+    """Кладёт лог в кэш, в дневной файл и рассылает клиентам."""
     with _log_lock:
         LOG_CACHE.append(payload)
+    _append_log_file(payload)
     socketio.emit('log_event', payload)
 
 

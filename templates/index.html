@@ -864,11 +864,13 @@
 
       if (!rowMatchesLogFilter(row)) row.classList.add('log-row-hidden');
 
-      el.log.appendChild(row);
-      while (el.log.children.length > 400) {
-        el.log.removeChild(el.log.firstChild);
+      const box = el.log;
+      const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 48;
+      box.appendChild(row);
+      while (box.children.length > 4000) {
+        box.removeChild(box.firstChild);
       }
-      el.log.scrollTop = el.log.scrollHeight;
+      if (nearBottom) box.scrollTop = box.scrollHeight;
     }
 
     function exportVisibleLog() {

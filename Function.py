@@ -36,11 +36,10 @@ def human_delay(lo, hi=None):
 def human_sleep(lo, hi=None, *, kind=None, log=None):
     """time.sleep с человеческим разбросом. Возвращает фактическую паузу.
 
-    kind — тип паузы для UI/логов (roll, action, schedule, …).
-    log — True/False; по умолчанию логируем всё, кроме action/poll.
+    kind — тип паузы для UI. В ленту событий пауза не пишется.
     """
     delay = human_delay(lo, hi)
-    should_log = log if log is not None else kind not in (None, 'action', 'poll')
+    should_log = bool(log)
     if kind:
         WebDashboard.emit_timing(
             last_sleep_sec=round(delay, 2),
@@ -116,6 +115,8 @@ PROFILE_STATE = {
     'current_threshold': float(getattr(Vars, 'min_power_threshold', 80)),
     'kakera_power': 0,
     'kakera_cost': 0,
+    'kakera_cost_keys': 0,
+    'kakera_power_full': False,
     'kakera_ready': True,
 }
 
@@ -245,6 +246,37 @@ def kakera_cooldown_left_seconds():
     return max(0, int(KAKERA_COOLDOWN_UNTIL - time.time()))
 
 
+def reaction_energy_missing(state=None):
+    """Силы на реакцию нет: кулдаун Mudae, kakera_ready=False или Power ниже цены кнопки."""
+    state = PROFILE_STATE if state is None else state
+    if kakera_on_cooldown():
+        return True
+    if state.get('kakera_ready') is False:
+        return True
+    if state.get('kakera_power_full'):
+        return False
+    power = state.get('kakera_power')
+    cost = int(state.get('kakera_cost') or 0)
+    if power is None or cost <= 0:
+        return False
+    try:
+        return int(power) < cost
+    except (TypeError, ValueError):
+        return False
+
+
+def note_kakera_restored_by_dk():
+    """$dk полностью возвращает силу реакции. Старый Power клики больше не блокирует."""
+    global KAKERA_COOLDOWN_UNTIL
+    KAKERA_COOLDOWN_UNTIL = 0.0
+    PROFILE_STATE['kakera_ready'] = True
+    PROFILE_STATE['kakera_power'] = None
+    PROFILE_STATE['kakera_power_full'] = True
+    PROFILE_STATE['dk_ready'] = False
+    PROFILE_STATE['dk_minutes_left'] = 0
+    sync_profile_state(PROFILE_STATE)
+
+
 # Ожидающий клейм (карточка до подтверждения «married»)
 _PENDING_CLAIM = None
 # Последняя наша свадьба. Gateway часто разбирает её раньше, чем опрос после клика.
@@ -279,16 +311,15 @@ def _parse_marriage_parties(parsed):
 
 
 def try_use_dk_for_kakera_cd():
-    """$dk при откате реакции какеры (если $dk готов по кэшу профиля)."""
+    """$dk только если команда готова и силы на реакцию нет."""
     if not PROFILE_STATE.get('dk_ready'):
         return False
-    log_msg('KAKER', "Какера в КД — пробую $dk...", dim=True)
-    if _send_text_command('$dk') not in [200, 204]:
+    if not reaction_energy_missing():
         return False
-    log_msg('KAKER', '$dk отправлен (после КД какеры).')
-    PROFILE_STATE['dk_ready'] = False
-    PROFILE_STATE['dk_minutes_left'] = 0
-    sync_profile_state(PROFILE_STATE)
+    if _send_text_command('$dk') not in (200, 204):
+        return False
+    note_kakera_restored_by_dk()
+    log_msg('KAKER', '$dk отправлен. Сила реакции восстановлена.')
     return True
 
 
@@ -699,11 +730,17 @@ def _profile_log(state):
 
     thr = state.get('current_threshold')
     thr_part = f", порог клейма: {thr:g}" if thr is not None else ''
+    if state.get('kakera_power_full'):
+        power_part = ', сила реакции восстановлена'
+    elif state.get('kakera_power') is not None and int(state.get('kakera_cost') or 0):
+        power_part = f", сила {int(state['kakera_power'])}%"
+    else:
+        power_part = ''
     log_msg(
         'SYS',
         f"Профиль: Клейм {claim_status}, $rt {_util_status(state.get('rt_ready'))}, "
         f"$daily {_util_status(state.get('daily_ready'))}, "
-        f"$dk {_util_status(state.get('dk_ready'))}, "
+        f"$dk {_util_status(state.get('dk_ready'))}{power_part}, "
         f"Роллы: {state['rolls_left']} (сброс через {state.get('rolls_reset_minutes', 0)} мин), "
         f"Сбросы: {state['rolls_resets']}{thr_part}",
     )
@@ -988,7 +1025,8 @@ def sync_profile_state(state):
         return PROFILE_STATE
     for key in (
         'can_claim', 'rt_ready', 'claim_minutes_left', 'rolls_left', 'rolls_resets',
-        'rolls_reset_minutes', 'kakera_power', 'kakera_cost', 'kakera_ready',
+        'rolls_reset_minutes', 'kakera_power', 'kakera_cost', 'kakera_cost_keys',
+        'kakera_power_full', 'kakera_ready',
         'current_threshold', 'rt_minutes_left', 'daily_ready', 'daily_minutes_left',
         'dk_ready', 'dk_minutes_left', 'claim_ttl',
     ):
@@ -1130,18 +1168,40 @@ def updateProfileState(_refreshed_after_dk=False, skip_actions=False):
     daily_ready, daily_minutes = _parse_cmd_cooldown(parsed_text, 'daily')
     dk_ready, dk_minutes = _parse_cmd_cooldown(parsed_text, 'dk')
 
-    # КД реакции какеры из $tu — источник истины (не глобальный таймер из чата)
+    # КД реакции из $tu. Сразу после $dk старая фраза «can't react» таймер не возвращает.
     global KAKERA_COOLDOWN_UNTIL
+    kakera_power = extract_int(r"Power:\s*(\d+)%")
+    kakera_cost = extract_int(r"consumes\s+(\d+)%\s+of your reaction power")
+    half_match = re.search(
+        r"10\+\s*keys consume half the power \((\d+)%\)",
+        parsed_text,
+        re.IGNORECASE,
+    )
+    kakera_cost_keys = int(half_match.group(1)) if half_match else 0
     kakera_cd = re.search(
         r"you can't react to kakera for\s+(?:(\d+)\s*h\s*)?(\d+)\s*min",
         parsed_text,
         re.IGNORECASE,
     )
-    # Явная готовность: "You can react to kakera right now!"
     kakera_ready_tu = bool(
         re.search(r"you\s+can\s+react\s+to\s+kakera\b", lower_text, re.IGNORECASE)
     )
-    if kakera_ready_tu:
+    power_full = False
+    if _refreshed_after_dk:
+        full_cost = kakera_cost or int(PROFILE_STATE.get('kakera_cost') or 0)
+        restored = kakera_ready_tu or (full_cost > 0 and kakera_power >= full_cost)
+        KAKERA_COOLDOWN_UNTIL = 0.0
+        kakera_ready = True
+        if restored:
+            power_full = False
+        else:
+            kakera_power = None
+            power_full = True
+            if not kakera_cost:
+                kakera_cost = int(PROFILE_STATE.get('kakera_cost') or 0)
+            if not kakera_cost_keys:
+                kakera_cost_keys = int(PROFILE_STATE.get('kakera_cost_keys') or 0)
+    elif kakera_ready_tu:
         KAKERA_COOLDOWN_UNTIL = 0.0
         kakera_ready = True
     elif kakera_cd:
@@ -1150,10 +1210,8 @@ def updateProfileState(_refreshed_after_dk=False, skip_actions=False):
             KAKERA_COOLDOWN_UNTIL = time.time() + minutes * 60
         kakera_ready = False
     elif "can't react to kakera" in lower_text:
-        # Фраза КД есть, но время не распарсили — не сбрасываем таймер
         kakera_ready = False
     else:
-        # В $tu нет строки про реакцию — опираемся на локальный таймер
         kakera_ready = not kakera_on_cooldown()
         if kakera_ready:
             KAKERA_COOLDOWN_UNTIL = 0.0
@@ -1170,8 +1228,10 @@ def updateProfileState(_refreshed_after_dk=False, skip_actions=False):
         'daily_minutes_left': daily_minutes,
         'dk_ready': dk_ready,
         'dk_minutes_left': dk_minutes,
-        'kakera_power': extract_int(r"Power:\s*(\d+)%"),
-        'kakera_cost': extract_int(r"consumes\s+(\d+)%\s+of your reaction power"),
+        'kakera_power': kakera_power,
+        'kakera_cost': kakera_cost,
+        'kakera_cost_keys': kakera_cost_keys,
+        'kakera_power_full': power_full,
         'kakera_ready': kakera_ready,
         'current_threshold': compute_claim_threshold(claim_minutes_left),
         'claim_ttl': get_claim_ttl(),
@@ -1187,16 +1247,15 @@ def updateProfileState(_refreshed_after_dk=False, skip_actions=False):
         if _send_text_command('$daily') in [200, 204]:
             log_msg('SYS', '🎁 Ежедневная награда ($daily) успешно забрана!')
 
-    # $dk — только если какера в КД реакции (не по «энергии»)
+    # $dk полностью восстанавливает силу. Жать только когда он готов и реакции нет.
     if (
         state['dk_ready'] is True
-        and not kakera_ready
+        and reaction_energy_missing(state)
         and not _refreshed_after_dk
     ):
-        log_msg('KAKER', "$dk доступен и какера в КД. Отправляю $dk.", dim=True)
-        if _send_text_command('$dk') in [200, 204]:
-            log_msg('KAKER', '$dk отправлен.')
-            KAKERA_COOLDOWN_UNTIL = 0.0
+        if _send_text_command('$dk') in (200, 204):
+            note_kakera_restored_by_dk()
+            log_msg('KAKER', '$dk отправлен. Сила реакции восстановлена.')
             return updateProfileState(_refreshed_after_dk=True)
 
     # $rolls: есть смысл крутить, если доступен клейм ИЛИ реакция какеры ($tu)
@@ -1549,13 +1608,158 @@ def _is_ourosphere_button(button):
     return _is_ourosphere_name(_button_emoji_name(button))
 
 
-def _kakera_targets(message):
-    """Кнопки какеры и ourosphere. Сферы — даже на КД какеры, дорогие первыми.
+_KEY_COUNT_RE = re.compile(
+    r'<\s*a?:chaoskey:\d+\s*>\s*\**\s*(\d{1,4})'
+    r'|(\d{1,4})\s*\**\s*<\s*a?:chaoskey:\d+\s*>'
+    r'|\bkeys?\s*[:=]?\s*(\d{1,4})\b'
+    r'|\b(\d{1,4})\s+keys?\b',
+    re.IGNORECASE,
+)
+_LOOT_DIRTY = set()
 
-    Сфера не тратит реакцию $k, поэтому её берём, когда какера в кулдауне.
-    """
+
+def _card_key_count(message):
+    """Число ключей, если оно написано на карте. Иначе 0 — скидку не берём."""
+    parts = [_message_text_blob(message or {})]
+    for embed in (message or {}).get('embeds') or []:
+        if not isinstance(embed, dict):
+            continue
+        for field in embed.get('fields') or []:
+            if isinstance(field, dict):
+                parts.append(str(field.get('name') or ''))
+                parts.append(str(field.get('value') or ''))
+    match = _KEY_COUNT_RE.search('\n'.join(parts))
+    if not match:
+        return 0
+    for group in match.groups():
+        if group:
+            return int(group)
+    return 0
+
+
+def _kakera_button_cost(message):
+    full = int(PROFILE_STATE.get('kakera_cost') or 0)
+    half = int(PROFILE_STATE.get('kakera_cost_keys') or 0)
+    if half and message is not None and _card_key_count(message) >= 10:
+        return half
+    return full
+
+
+def _kakera_clicks_open(message=None):
+    """Можно жать какеру: нет кулдауна и хватает Power. Сферы от этого не зависят."""
+    if kakera_on_cooldown():
+        return False
+    if PROFILE_STATE.get('kakera_power_full'):
+        return True
+    power = PROFILE_STATE.get('kakera_power')
+    if power is None:
+        return True
+    cost = _kakera_button_cost(message) if message is not None else int(
+        PROFILE_STATE.get('kakera_cost') or 0
+    )
+    if cost <= 0:
+        return True
+    try:
+        return int(power) >= cost
+    except (TypeError, ValueError):
+        return True
+
+
+def _spend_kakera_power(message):
+    if PROFILE_STATE.get('kakera_power_full'):
+        return
+    power = PROFILE_STATE.get('kakera_power')
+    if power is None:
+        return
+    cost = _kakera_button_cost(message)
+    if cost <= 0:
+        return
+    left = max(0, int(power) - cost)
+    PROFILE_STATE['kakera_power'] = left
+    if left < cost:
+        PROFILE_STATE['kakera_ready'] = False
+
+
+def _raw_loot_buttons(message):
     kakera_names = _kakera_click_names()
-    take_kakera = not kakera_on_cooldown()
+    found = []
+    for button in _iter_message_buttons((message or {}).get('components')):
+        emoji = _button_emoji_name(button)
+        key = emoji.casefold()
+        if key in _OUROSPHERE_VALUES_CF or key in kakera_names or emoji.lower().startswith('kakera'):
+            found.append((emoji, button))
+    return found
+
+
+def _desired_kakera_buttons(message):
+    names = _kakera_click_names()
+    return [
+        (emoji, button)
+        for emoji, button in _raw_loot_buttons(message)
+        if emoji.casefold() in names
+    ]
+
+
+def _raw_loot_signature(message):
+    return tuple(
+        f"{emoji}:{button.get('custom_id', '')}"
+        for emoji, button in _raw_loot_buttons(message)
+    )
+
+
+def _join_name_counts(names):
+    order = []
+    counts = {}
+    for name in names:
+        if name not in counts:
+            order.append(name)
+            counts[name] = 0
+        counts[name] += 1
+    return ', '.join(f"{name} ×{counts[name]}" for name in order)
+
+
+def _loot_shortfall_reason(message):
+    if kakera_on_cooldown():
+        return f"КД {kakera_cooldown_left_seconds()} сек"
+    if not _kakera_clicks_open(message):
+        power = PROFILE_STATE.get('kakera_power')
+        cost = _kakera_button_cost(message)
+        if power is None:
+            return 'силы нет'
+        return f"сила {int(power)}% < {int(cost)}%"
+    return 'кнопка не дорисовалась'
+
+
+def _log_loot_summary(message, clicked_kakera, clicked_spheres, seen, log_prefix):
+    parts = []
+    total = len(clicked_kakera)
+    if seen or total:
+        if seen > total:
+            if len(set(clicked_kakera)) == 1:
+                label = clicked_kakera[0]
+            elif clicked_kakera:
+                label = 'какера'
+            else:
+                visible = _desired_kakera_buttons(message)
+                names = {name for name, _button in visible}
+                label = visible[0][0] if len(names) == 1 else 'какера'
+            parts.append(f"{label} {total}/{seen}, {_loot_shortfall_reason(message)}")
+        elif clicked_kakera:
+            parts.append(_join_name_counts(clicked_kakera))
+    if clicked_spheres:
+        parts.append(_join_name_counts(clicked_spheres))
+    if not parts:
+        return
+    text = ', '.join(parts)
+    if log_prefix and log_prefix != 'Найдена кнопка какеры':
+        text = f"{log_prefix}: {text}"
+    log_msg('KAKER', text, dim=seen <= total)
+
+
+def _kakera_targets(message):
+    """Кнопки какеры и ourosphere. Сферы жмутся и без силы на реакцию."""
+    kakera_names = _kakera_click_names()
+    take_kakera = _kakera_clicks_open(message)
     targets = []
     for button in _iter_message_buttons(message.get('components')):
         emoji = _button_emoji_name(button)
@@ -1575,48 +1779,55 @@ def _kakera_targets(message):
     return targets
 
 
-def _kakera_signature(message):
-    names = []
-    for emoji, button in _kakera_targets(message):
-        names.append(f"{emoji}:{button.get('custom_id', '')}")
-    return tuple(names)
-
-
 def _refresh_kakera_message(message):
-    channel_id = message.get('channel_id') or Vars.channelId
-    fetched = _fetch_channel_message(channel_id, message.get('id'), quiet=True)
-    return fetched or message
-
-
-def _wait_kakera_buttons_ready(message, *, timeout=1.15):
-    """Ждёт, пока Mudae дорисует кнопки ($bku часто добавляет 3-ю какеру правкой)."""
-    desc = ' '.join(
-        (embed.get('description') or '')
-        for embed in (message.get('embeds') or [])
-    ).lower()
-    expect_late_button = '$bku' in desc or bool(_kakera_targets(message))
-    if not expect_late_button:
+    if not message:
         return message
+    mid = str(message.get('id') or '')
+    fetched = None
+    if message.get('id'):
+        fetched = _fetch_channel_message(
+            message.get('channel_id') or Vars.channelId,
+            message.get('id'),
+            quiet=True,
+        )
+    cached = _MESSAGE_CACHE.get(mid) if mid else None
+    best = message
+    best_n = len(_raw_loot_signature(best))
+    for candidate in (cached, fetched):
+        if not isinstance(candidate, dict) or not candidate.get('components'):
+            continue
+        count = len(_raw_loot_signature(candidate))
+        if count >= best_n:
+            best = candidate
+            best_n = count
+    return best
+
+
+def _wait_kakera_buttons_ready(message, *, timeout=None):
+    """Ждёт, пока набор кнопок перестанет меняться. $bku часто дорисовывает третью."""
+    blob = _message_text_blob(message).lower()
+    if '$bku' not in blob and not _raw_loot_buttons(message):
+        return message
+    if timeout is None:
+        timeout = 2.2 if '$bku' in blob else 1.15
+    stable_for = 0.45 if '$bku' in blob else 0.32
 
     deadline = time.monotonic() + timeout
-    last_sig = _kakera_signature(message)
+    last_sig = _raw_loot_signature(message)
     last_change = time.monotonic()
     current = message
 
     while time.monotonic() < deadline:
         human_sleep(0.18, 0.28, kind='kakera', log=False)
+        mid = str(current.get('id') or '')
+        if mid and mid in _LOOT_DIRTY:
+            _LOOT_DIRTY.discard(mid)
         current = _refresh_kakera_message(current)
-        sig = _kakera_signature(current)
+        sig = _raw_loot_signature(current)
         if sig != last_sig:
             last_sig = sig
             last_change = time.monotonic()
-            log_msg(
-                'KAKER',
-                f"Кнопки какеры обновились: {len(sig)} шт. "
-                f"({', '.join(s.split(':')[0] for s in sig)}).",
-                dim=True,
-            )
-        elif last_sig and time.monotonic() - last_change >= 0.32:
+        elif last_sig and time.monotonic() - last_change >= stable_for:
             break
     return current
 
@@ -1628,15 +1839,8 @@ def click_desired_kakera(
     clicked_ids=None,
     wait_for_buttons=True,
 ):
-    """Жмёт какеры и ourosphere по одной, каждый раз с актуальными custom_id.
-
-    Пачка кликов по первому снимку кнопки ломает 3-ю+: после $bku / клика
-    Mudae правит сообщение, старые custom_id перестают работать, а новая
-    какера появляется только в следующем GET.
-    Сферы (sp, spP, …) жмутся и когда какера в кулдауне.
-    clicked_ids — уже нажатые custom_id (чтобы правка сообщения не кликнула их снова).
-    """
-    if not message:
+    """Жмёт какеры и ourosphere по одной, каждый раз с актуальным custom_id."""
+    if not message or not message.get('id'):
         return 0
     if clicked_ids is None:
         clicked_ids = set()
@@ -1647,41 +1851,61 @@ def click_desired_kakera(
 
     if wait_for_buttons:
         message = _wait_kakera_buttons_ready(message)
-    elif not _kakera_targets(message):
+    elif not _raw_loot_buttons(message):
         message = _refresh_kakera_message(message)
-        if not _kakera_targets(message):
+        if not _raw_loot_buttons(message):
             human_sleep(0.35, 0.55, kind='kakera', log=False)
             message = _refresh_kakera_message(message)
-    if not _kakera_targets(message):
-        _log_unclicked_kakera(message)
-        return 0
 
     channel_id = message.get('channel_id') or Vars.channelId
     guild_id = message.get('guild_id') or Vars.serverId
     clicks = 0
+    clicked_kakera = []
+    clicked_spheres = []
+    seen = len(_desired_kakera_buttons(message))
     last_poll_id = str(message['id'])
+    late_settled = False
+    energy_tried = False
+    final_polled = False
 
     while clicks < limit:
+        seen = max(seen, len(_desired_kakera_buttons(message)))
         targets = [
             item for item in _kakera_targets(message)
             if item[1].get('custom_id') not in clicked_ids
         ]
         if not targets:
-            human_sleep(0.2, 0.32, kind='kakera', log=False)
-            message = _refresh_kakera_message(message)
-            targets = [
-                item for item in _kakera_targets(message)
-                if item[1].get('custom_id') not in clicked_ids
-            ]
-            if not targets:
-                break
+            mid = str(message.get('id') or '')
+            dirty = mid in _LOOT_DIRTY
+            if dirty:
+                _LOOT_DIRTY.discard(mid)
+            late = '$bku' in _message_text_blob(message).lower()
+            if (dirty or late) and not late_settled:
+                late_settled = True
+                message = _wait_kakera_buttons_ready(message)
+                continue
+            if not energy_tried and _desired_kakera_buttons(message):
+                energy_tried = True
+                if try_use_dk_for_kakera_cd():
+                    message = _refresh_kakera_message(message)
+                    continue
+            if clicks and not final_polled:
+                final_polled = True
+                poll_mudae_chat_replies(
+                    last_poll_id,
+                    channel_id=channel_id,
+                    attempts=2,
+                    delay=human_delay(0.2, 0.35),
+                )
+                message = _refresh_kakera_message(message)
+                seen = max(seen, len(_desired_kakera_buttons(message)))
+                continue
+            break
 
         emoji, button = targets[0]
         custom_id = button.get('custom_id')
-        # Резервируем id до запроса, чтобы параллельный проход не взял ту же кнопку.
         clicked_ids.add(custom_id)
-        remaining = len(targets)
-        shown = emoji if log_prefix == 'Найдена кнопка какеры' else f'{log_prefix}: {emoji}'
+        is_kakera = emoji.casefold() in _kakera_click_names()
         try:
             human_sleep(0.08, 0.18, kind='kakera', log=False)
             author_id = (message.get('author') or {}).get('id') or botID
@@ -1696,19 +1920,16 @@ def click_desired_kakera(
             status = getattr(response, 'status_code', None)
             if status not in (200, 204, None):
                 log_msg('WARN', f"Клик {emoji} отклонён (код: {status})")
-                clicked_ids.add(custom_id)
-                message = _refresh_kakera_message(message)
-                continue
-            clicks += 1
-            log_msg(
-                'KAKER',
-                f"{shown}: клик отправлен"
-                + (f", ещё {remaining - 1}." if remaining > 1 else "."),
-                dim=True,
-            )
+            else:
+                clicks += 1
+                energy_tried = False
+                if is_kakera:
+                    clicked_kakera.append(emoji)
+                    _spend_kakera_power(message)
+                else:
+                    clicked_spheres.append(emoji)
         except Exception as error:
             log_msg('WARN', f"Ошибка нажатия: {error}")
-            clicked_ids.add(custom_id)
 
         poll_mudae_chat_replies(
             last_poll_id,
@@ -1718,13 +1939,11 @@ def click_desired_kakera(
         )
         message = _refresh_kakera_message(message)
 
-    if clicks:
-        poll_mudae_chat_replies(
-            last_poll_id,
-            channel_id=channel_id,
-            attempts=2,
-            delay=human_delay(0.2, 0.35),
-        )
+    seen = max(seen, len(_desired_kakera_buttons(message)), len(clicked_kakera))
+    if seen == 0 and not clicked_spheres:
+        _log_unclicked_kakera(message)
+    else:
+        _log_loot_summary(message, clicked_kakera, clicked_spheres, seen, log_prefix)
     return clicks
 
 
@@ -2463,37 +2682,37 @@ _LOOT_ACTIVE = set()
 
 
 def click_card_loot(message, *, log_prefix='Найдена кнопка какеры'):
-    """Какера из Vars.desiredKakeras и ourosphere. Повторный клик той же кнопки не шлём.
-
-    CREATE и UPDATE одной карточки часто приходят вместе. Второй заход
-    пропускаем, пока первый проход ещё жмёт кнопки.
-    """
+    """Какера из Vars.desiredKakeras и ourosphere. Повторный клик той же кнопки не шлём."""
     if not message or not message.get('id'):
         return 0
     _learn_emoji_shortcodes(_message_text_blob(message))
     mid = str(message['id'])
     with _LOOT_GUARD:
         if mid in _LOOT_ACTIVE:
+            _LOOT_DIRTY.add(mid)
             return 0
         _LOOT_ACTIVE.add(mid)
-    if kakera_on_cooldown() and message.get('components'):
-        if _remember_set(_KAKERA_CD_LOGGED, mid):
-            log_msg(
-                'KAKER',
-                f"Какера в КД ещё {kakera_cooldown_left_seconds()} сек — "
-                f"проверяю только ourosphere.",
-                dim=True,
-            )
+        _LOOT_DIRTY.discard(mid)
     try:
-        return click_desired_kakera(
-            message,
-            log_prefix=log_prefix,
-            clicked_ids=_clicked_components(mid),
-            wait_for_buttons=False,
-        )
+        total = 0
+        clicked_ids = _clicked_components(mid)
+        for _ in range(4):
+            total += click_desired_kakera(
+                message,
+                log_prefix=log_prefix,
+                clicked_ids=clicked_ids,
+                wait_for_buttons=True,
+            ) or 0
+            with _LOOT_GUARD:
+                if mid not in _LOOT_DIRTY:
+                    break
+                _LOOT_DIRTY.discard(mid)
+            message = _MESSAGE_CACHE.get(mid) or message
+        return total
     finally:
         with _LOOT_GUARD:
             _LOOT_ACTIVE.discard(mid)
+            _LOOT_DIRTY.discard(mid)
 
 
 def on_mudae_gateway_message(message, *, is_update=False):
@@ -2642,12 +2861,6 @@ def _simpleRoll_body():
     begin_roll_session(profile_state, current_threshold, jackpot_threshold)
     rolls_done = 0
     max_rolls = int(getattr(Vars, 'max_rolls_per_session', 150))
-    log_msg(
-        'ROLL',
-        "Канал слушаю через Gateway. Здесь только отправка команд, "
-        "клики по своим роллам — сразу по событию.",
-        dim=True,
-    )
     try:
         while rolls_done < max_rolls:
             if roll_session_limit_reached():
@@ -2660,7 +2873,6 @@ def _simpleRoll_body():
                 break
 
             process_roll_claim_buffer(force=False)
-            log_msg('ROLL', f"#{rolls_done + 1}: отправляю Slash-команду прокрута...", dim=True)
             action_pause()
             LAST_OUR_ROLL_TIME = time.time()
             try:

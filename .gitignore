@@ -6,6 +6,7 @@ mudae_history.db
 *.db-wal
 *.db-shm
 __pycache__/
+logs/
 *.pyc
 .idea/
 .vscode/
