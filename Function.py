@@ -184,12 +184,16 @@ def _parse_rolls_interval_minutes(text):
     return int(match.group(1) or 0) * 60 + int(match.group(2) or 0)
 
 
+_PENDING_ROLLS_ACCOUNT = None
+
+
 def _parse_rolls_interval_block(text):
     """«One rolls reset per interval. Time left: 5 min.»"""
     if not _ROLLS_INTERVAL_BLOCK_RE.search(text or ''):
         return None
     minutes = _parse_rolls_interval_minutes(text)
-    _set_rolls_reset_cooldown(minutes, reason='ответ Mudae')
+    account = _PENDING_ROLLS_ACCOUNT or _active_account()
+    _set_rolls_reset_cooldown(minutes, reason='ответ Mudae', account=account)
     return {'type': 'rolls_interval', 'minutes': minutes}
 
 # Дедуп логов DROP и начислений по message id
@@ -347,17 +351,56 @@ def _parse_marriage_parties(parsed):
     return {'claimer': claimer, 'character': character}
 
 
+_DK_ENOUGH_POWER_RE = re.compile(
+    r"enough power to react to kakera right now\s*\((\d+)\s*%\)",
+    re.IGNORECASE,
+)
+
+
 def try_use_dk_for_kakera_cd():
-    """$dk только если команда готова и силы на реакцию нет."""
+    """$dk только этому аккаунту и только если его собственная сила ниже цены кнопки.
+
+    Если Mudae пишет, что силы и так хватает, отвечаем no и $dk не списываем.
+    """
     account = _active_account()
-    if not account.profile.get('dk_ready'):
+    profile = account.profile
+    if not profile.get('dk_ready'):
         return False
-    if not reaction_energy_missing(account.profile):
+    if profile.get('kakera_power_full'):
         return False
+    power = profile.get('kakera_power')
+    cost = int(profile.get('kakera_cost') or 0)
+    if power is None or cost <= 0:
+        return False
+    try:
+        if int(power) >= cost:
+            return False
+    except (TypeError, ValueError):
+        return False
+    before_id = _get_latest_message_id()
     if _send_text_command('$dk', account) not in (200, 204):
         return False
+    reply = _wait_for_mudae_reply(before_id)
+    text = (reply or {}).get('content') or ''
+    enough = _DK_ENOUGH_POWER_RE.search(text)
+    if enough:
+        reported = int(enough.group(1))
+        profile['kakera_power'] = reported
+        profile['kakera_power_full'] = False
+        profile['kakera_ready'] = reported >= cost
+        profile['dk_ready'] = True
+        sync_profile_state(profile)
+        _send_text_command('no', account)
+        log_msg(
+            'KAKER',
+            f"{account.label}: у него ещё {reported}% силы, $dk не трачу.",
+        )
+        return False
     note_kakera_restored_by_dk(account)
-    log_msg('KAKER', f"$dk отправлен ({account.label}). Сила реакции восстановлена.")
+    log_msg(
+        'KAKER',
+        f"$dk отправлен ({account.label}). Сила восстановится только у этого аккаунта.",
+    )
     return True
 
 
@@ -1127,19 +1170,24 @@ def _try_use_rolls(profile_state, *, context=''):
 
     suffix = f" — {context}" if context else ''
     log_msg('ROLL', f"Использую $rolls{suffix} ({account.label}).")
-    last_message_id = _get_latest_message_id()
-    if _send_text_command('$rolls', account) not in [200, 204]:
-        return False
-
-    mudae_message = _wait_for_mudae_reply(last_message_id)
-    if mudae_message:
-        with _use_account(account):
-            handle_mudae_chat(
-                mudae_message.get('content', ''),
-                message_id=mudae_message.get('id'),
-            )
-        if rolls_reset_on_cooldown(account):
+    global _PENDING_ROLLS_ACCOUNT
+    _PENDING_ROLLS_ACCOUNT = account
+    try:
+        last_message_id = _get_latest_message_id()
+        if _send_text_command('$rolls', account) not in [200, 204]:
             return False
+
+        mudae_message = _wait_for_mudae_reply(last_message_id)
+        if mudae_message:
+            with _use_account(account):
+                handle_mudae_chat(
+                    mudae_message.get('content', ''),
+                    message_id=mudae_message.get('id'),
+                )
+            if rolls_reset_on_cooldown(account):
+                return False
+    finally:
+        _PENDING_ROLLS_ACCOUNT = None
 
     reset_in = int(profile_state.get('rolls_reset_minutes', 0) or 0)
     if reset_in <= 0:
@@ -1293,16 +1341,11 @@ def updateProfileState(_refreshed_after_dk=False, skip_actions=False, account=No
         if _send_text_command('$daily', account) in [200, 204]:
             log_msg('SYS', '🎁 Ежедневная награда ($daily) успешно забрана!')
 
-    # $dk полностью восстанавливает силу. Жать только когда он готов и реакции нет.
-    if (
-        state['dk_ready'] is True
-        and reaction_energy_missing(state)
-        and not _refreshed_after_dk
-    ):
-        if _send_text_command('$dk', account) in (200, 204):
-            note_kakera_restored_by_dk(account)
-            log_msg('KAKER', f"$dk отправлен ({account.label}). Сила реакции восстановлена.")
-            return updateProfileState(_refreshed_after_dk=True, account=account)
+    # $dk этого аккаунта, только если его сила ниже цены кнопки.
+    if state['dk_ready'] is True and not _refreshed_after_dk:
+        with _use_account(account):
+            if try_use_dk_for_kakera_cd():
+                return updateProfileState(_refreshed_after_dk=True, account=account)
 
     # $rolls: есть смысл крутить, если доступен клейм ИЛИ реакция какеры ($tu)
     if state['rolls_left'] == 0 and state['rolls_resets'] > 0:
@@ -1942,7 +1985,11 @@ def click_desired_kakera(
                 late_settled = True
                 message = _wait_kakera_buttons_ready(message)
                 continue
-            if not energy_tried and _desired_kakera_buttons(message):
+            if (
+                not energy_tried
+                and not _kakera_clicks_open(message)
+                and _desired_kakera_buttons(message)
+            ):
                 energy_tried = True
                 if try_use_dk_for_kakera_cd():
                     message = _refresh_kakera_message(message)
@@ -3193,61 +3240,42 @@ def note_us_reaction(message_id, user_id, emoji_name):
 _US_BATCH = 20
 
 
-def _confirm_us_batch(account):
-    """Один $us 20. True, только если Mudae поставила галочку."""
+def _send_us_batch(account):
+    """Один $us 20. Галочку не ждём: стоп только по фразе Mudae о лимите."""
     response = post_text_message('$us 20', account)
     if response is None or response.status_code not in (200, 204):
         log_msg('WARN', 'Не удалось отправить $us 20.')
-        return False
-    message_id = ''
-    try:
-        message_id = str((response.json() or {}).get('id') or '')
-    except ValueError:
-        message_id = ''
-    if not message_id:
-        log_msg('WARN', '$us 20 ушло, но id сообщения не пришёл.')
-        return False
-    arm_us_wait(message_id)
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline and not _US_READY.is_set():
-        if _message_has_checkmark(message_id, account):
-            _US_READY.set()
-            break
-        time.sleep(0.4)
-    if not _US_READY.is_set():
-        log_msg('WARN', 'Mudae не поставила галочку на $us 20.')
         return False
     return True
 
 
 def use_stacked_rolls(count=20, stop_before=None):
-    """Несколько $us 20, затем столько же слэшей. Часовой запас не тратит.
+    """Несколько $us 20, затем слэши, пока Mudae не напишет, что роллы кончились.
 
-    100 роллов — это пять команд `$us 20`. Без галочки пачка обрывается,
-    и крутятся только уже подтверждённые.
+    200 роллов — это десять команд `$us 20`. Часовой запас не тратит.
     """
     account = Accounts.MAIN
     requested = max(_US_BATCH, int(count or _US_BATCH))
     batches = (requested + _US_BATCH - 1) // _US_BATCH
-    unlocked = 0
+    sent = 0
     with _use_account(account):
         for index in range(batches):
             if stop_before is not None and time.time() >= _deadline_ts(stop_before):
                 log_msg('WARN', 'Ресет близко, оставшиеся $us 20 не отправляю.')
                 break
             log_msg('ROLL', f'Отправляю $us 20 ({index + 1}/{batches}).')
-            if not _confirm_us_batch(account):
+            if not _send_us_batch(account):
                 break
-            unlocked += _US_BATCH
+            sent += 1
             if index + 1 < batches:
                 human_sleep(0.8, 1.6, kind='action', log=False)
-        if unlocked <= 0:
-            log_msg('WARN', 'Ни один $us 20 не подтвердился. Роллы не начинаю.')
+        if sent <= 0:
+            log_msg('WARN', 'Ни один $us 20 не ушёл. Роллы не начинаю.')
             return False
-        log_msg('ROLL', f'Открыто {unlocked} разовых роллов. Кручу.')
+        log_msg('ROLL', f'$us 20 × {sent} отправлены. Кручу, пока Mudae не остановит.')
         simpleRoll(
             account,
-            max_rolls=unlocked,
+            max_rolls=sent * _US_BATCH,
             bonus_us=True,
             record_duration=False,
             stop_before=stop_before,
@@ -3287,7 +3315,12 @@ def _simpleRoll_body(account=None, *, max_rolls=None, bonus_us=False, stop_befor
             "Gateway ещё не слушает канал. Команды отправлю, но карточки могу пропустить.",
         )
 
-    profile_state = updateProfileState(account=account, skip_actions=bonus_us)
+    if bonus_us:
+        # $us уже в канале. $tu/$daily/$dk сюда не пишем, чтобы не перебить пачку.
+        profile_state = dict(account.profile)
+        profile_state['account_key'] = account.key
+    else:
+        profile_state = updateProfileState(account=account, skip_actions=False)
     if profile_state is None:
         # При отсутствии ответа $tu не рискуем клеймом и используем базовый порог.
         profile_state = {
@@ -3346,7 +3379,12 @@ def _simpleRoll_body(account=None, *, max_rolls=None, bonus_us=False, stop_befor
     max_rolls = max(1, int(max_rolls))
     try:
         while rolls_done < max_rolls:
-            if not wait_channel_quiet(
+            if bonus_us:
+                # Канал занят нашими $us. Чужой «эфир» и минутный $oh эту пачку не режут.
+                if stop_before is not None and time.time() >= _deadline_ts(stop_before):
+                    log_msg('ROLL', 'Сессия остановлена: дальше ресет роллов.')
+                    break
+            elif not wait_channel_quiet(
                 deadline=stop_before,
                 max_wait=None if stop_before else 20 * 60,
             ):

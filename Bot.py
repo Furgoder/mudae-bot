@@ -1,3 +1,9 @@
+import sys
+if __name__ == '__main__':
+    # python Bot.py грузит этот файл как __main__. Иначе import Bot в панели
+    # создаёт вторую очередь, и $us пишется не в ту, которую крутит воркер.
+    sys.modules['Bot'] = sys.modules[__name__]
+
 import threading
 import time
 import random
