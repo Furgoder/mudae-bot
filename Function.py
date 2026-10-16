@@ -232,17 +232,22 @@ _KAKERA_PLUS_RE = re.compile(
     rf'\+{_AMOUNT}\s*(?:\(\s*\$?k\s*\)|\$k(?!u)\b)',
     re.IGNORECASE,
 )
-# Сценарий C: клейм / свадьба
-# "💖 **claimer** and **Character Name** are now married! 💖"
-_MARRIAGE_RE = re.compile(
-    r'are now married!',
-    re.IGNORECASE,
-)
+# Сценарий C: клейм.
+# Английский: "💖 **claimer** and **Character** are now married! 💖"
+# Русский (другой язык аккаунта): "**Character** теперь под опекой **claimer**!"
 _MARRIAGE_PAIR_RE = re.compile(
     r'(?P<a>[^\n]+?)\s+and\s+(?P<b>[^\n]+?)\s+are now married',
     re.IGNORECASE,
 )
+_CUSTODY_RE = re.compile(
+    r'(?P<character>[^\n]+?)\s+теперь под опекой\s+(?P<claimer>[^\n!]+)',
+    re.IGNORECASE,
+)
 _DISCORD_EMOJI_RE = re.compile(r'<a?:\w+:\d+>')
+_FOOTER_OWNER_RE = re.compile(
+    r'(?:belongs to|принадлежит)\s+(.+)',
+    re.IGNORECASE,
+)
 
 
 
@@ -318,37 +323,168 @@ def note_kakera_restored_by_dk(account=None):
     sync_profile_state(account.profile)
 
 
-# Ожидающий клейм (карточка до подтверждения «married»)
+# Ожидающий клейм (карточка до подтверждения)
 _PENDING_CLAIM = None
 # Последняя наша свадьба. Gateway часто разбирает её раньше, чем опрос после клика.
 _LAST_OUR_MARRIAGE = {'at': 0.0, 'name': ''}
+# Карточка, которую сейчас клеймим. Правка футера «Belongs to» — сигнал успеха.
+_ACTIVE_CLAIM = {
+    'message_id': '',
+    'channel_id': '',
+    'since': 0.0,
+    'closed_at': 0.0,
+    'account_key': '',
+    'last_fetch': 0.0,
+}
+# message_id -> unix-время, когда футер показал нашего владельца
+_OWNED_CARD_AT = {}
+_CLAIM_COMMIT_LOCK = threading.Lock()
+# имя персонажа -> уже записанный клейм (чтобы текст и карточка не посчитались дважды)
+_COMMITTED_CLAIMS = {}
 
 
-def note_pending_claim(*, name='', series='', power=0, reason=''):
-    """Запоминает карту перед кликом клейма — для истории после свадьбы."""
+def note_pending_claim(*, name='', series='', power=0, reason='', message_id=''):
+    """Запоминает карту перед кликом клейма — для истории после подтверждения."""
     global _PENDING_CLAIM
     _PENDING_CLAIM = {
         'name': (name or '').strip(),
         'series': series or '',
         'power': int(power or 0),
         'reason': reason or '',
+        'message_id': str(message_id or ''),
         'at': time.time(),
     }
 
 
-def _parse_marriage_parties(parsed):
-    """Разбирает свадьбу Mudae: (claimer, character) или None.
+def _clean_party(text):
+    """Имя из текста Mudae: без сердец, markdown-хвостов и невидимых символов."""
+    cleaned = re.sub(r'[💖💕❤️❤]', '', text or '')
+    cleaned = re.sub(r'[\u200b\u200c\u200d\ufeff]', '', cleaned)
+    return cleaned.strip(' *·-!.,')
 
-    Формат: «claimer and Character Name are now married!»
+
+def _parse_claim_announcement(parsed):
+    """Разбирает подтверждение клейма. None, если это не оно.
+
+    Английский порядок: claimer and character.
+    Русский: character теперь под опекой claimer.
     """
-    match = _MARRIAGE_PAIR_RE.search(parsed)
-    if not match:
-        return None
-    claimer = re.sub(r'[💖💕❤️❤]', '', match.group('a')).strip(' *·-')
-    character = re.sub(r'[💖💕❤️❤]', '', match.group('b')).strip(' *·-')
-    if not claimer or not character:
-        return None
-    return {'claimer': claimer, 'character': character}
+    marriage = _MARRIAGE_PAIR_RE.search(parsed or '')
+    if marriage:
+        claimer = _clean_party(marriage.group('a'))
+        character = _clean_party(marriage.group('b'))
+        if claimer and character:
+            return {
+                'claimer': claimer,
+                'character': character,
+                'swappable': True,
+                'source': 'marriage',
+            }
+    custody = _CUSTODY_RE.search(parsed or '')
+    if custody:
+        claimer = _clean_party(custody.group('claimer'))
+        character = _clean_party(custody.group('character'))
+        if claimer and character:
+            return {
+                'claimer': claimer,
+                'character': character,
+                'swappable': False,
+                'source': 'custody',
+            }
+    return None
+
+
+def _apply_claim_record(
+    *,
+    character,
+    kakera=0,
+    ouros=0,
+    series='',
+    power=0,
+    reason='claim',
+    source='text',
+    quiet=False,
+):
+    """Пишет клейм один раз. Повтор того же имени только дополняет kakera."""
+    name = (character or '').strip() or '???'
+    key = name.casefold()
+    kakera = int(kakera or 0)
+    ouros = int(ouros or 0)
+    status = 'duplicate'
+    with _CLAIM_COMMIT_LOCK:
+        now = time.time()
+        stale = [
+            item_key for item_key, row in _COMMITTED_CLAIMS.items()
+            if now - float(row.get('at') or 0) > 180
+        ]
+        for item_key in stale:
+            _COMMITTED_CLAIMS.pop(item_key, None)
+        prev = _COMMITTED_CLAIMS.get(key)
+        if prev and now - float(prev.get('at') or 0) < 180:
+            extra_k = kakera - int(prev.get('kakera') or 0)
+            extra_o = ouros - int(prev.get('ouros') or 0)
+            if extra_k > 0 or extra_o > 0:
+                WebDashboard.update_stats(
+                    inc_kakera=max(0, extra_k),
+                    inc_ourospheres=max(0, extra_o),
+                )
+                if prev.get('id'):
+                    WebDashboard.bump_claim_rewards(
+                        prev['id'],
+                        kakera=max(0, extra_k),
+                        ourospheres=max(0, extra_o),
+                    )
+                prev['kakera'] = max(int(prev.get('kakera') or 0), kakera)
+                prev['ouros'] = max(int(prev.get('ouros') or 0), ouros)
+                log_msg(
+                    'CLAIM',
+                    f"К клейму {name} дописано +{max(0, extra_k)} kakera, "
+                    f"+{max(0, extra_o)} ourosphere "
+                    f"(всего k={WebDashboard.BOT_STATS['kakera_earned']}).",
+                )
+                status = 'topup'
+            else:
+                status = 'duplicate'
+        else:
+            item = WebDashboard.record_claim({
+                'name': name,
+                'series': series or '',
+                'power': int(power or 0),
+                'kakera': kakera,
+                'ourospheres': ouros,
+                'reason': reason or source,
+                'ts': now,
+            })
+            _COMMITTED_CLAIMS[key] = {
+                'at': now,
+                'kakera': kakera,
+                'ouros': ouros,
+                'id': (item or {}).get('id'),
+            }
+            WebDashboard.update_stats(
+                inc_kakera=kakera,
+                inc_claims=1,
+                inc_ourospheres=ouros,
+            )
+            if source == 'card' and kakera <= 0 and ouros <= 0:
+                if not quiet:
+                    log_msg('CLAIM', f"Клейм засчитан по карточке: {name}.")
+            elif source == 'custody':
+                log_msg(
+                    'CLAIM',
+                    f"Клейм! {name} · +{kakera} kakera, +{ouros} ourosphere "
+                    f"(всего k={WebDashboard.BOT_STATS['kakera_earned']}, "
+                    f"o={WebDashboard.BOT_STATS.get('ourospheres_earned', 0)}).",
+                )
+            else:
+                log_msg(
+                    'CLAIM',
+                    f"Свадьба! {name} · +{kakera} kakera, +{ouros} ourosphere "
+                    f"(всего k={WebDashboard.BOT_STATS['kakera_earned']}, "
+                    f"o={WebDashboard.BOT_STATS.get('ourospheres_earned', 0)}).",
+                )
+            status = 'new'
+    return status
 
 
 _DK_ENOUGH_POWER_RE = re.compile(
@@ -564,31 +700,29 @@ def handle_mudae_chat(content, message_id=None):
                 try_use_dk_for_kakera_cd()
             return {'type': 'kakera_cooldown', 'minutes': minutes}
 
-    # --- C: успешный клейм (свадьба) — только НАША ---
-    if _MARRIAGE_RE.search(parsed):
-        parties = _parse_marriage_parties(parsed)
-        if not parties:
-            return None
+    # --- C: успешный клейм — только НАШ. Текст зависит от языка аккаунта. ---
+    parties = _parse_claim_announcement(parsed)
+    if parties:
         claimer = parties['claimer']
         character = parties['character']
-        # Чужие свадьбы в канале игнорируем
+        # Чужие клеймы в канале игнорируем. В английском тексте порядок иногда обратный.
         if not _is_our_name(claimer):
-            # На случай редкого порядка «Character and claimer»
-            if _is_our_name(character):
+            if parties.get('swappable') and _is_our_name(character):
                 claimer, character = character, claimer
             else:
                 return None
         if not _once('marriage'):
             return None
 
-        global _LAST_OUR_MARRIAGE
+        global _LAST_OUR_MARRIAGE, _PENDING_CLAIM
         _LAST_OUR_MARRIAGE = {'at': time.time(), 'name': character}
 
         claimer_account = Accounts.by_name(claimer) or _active_account()
         claimer_account.profile['can_claim'] = False
         sync_profile_state(claimer_account.profile)
+        card_mid = _ACTIVE_CLAIM.get('message_id') or None
         if _ROLL_SESSION.get('active'):
-            _finish_claim_success(claimer_account, None)
+            _finish_claim_success(claimer_account, card_mid)
         else:
             WebDashboard.emit_buffer_clear()
 
@@ -596,7 +730,7 @@ def handle_mudae_chat(content, message_id=None):
         kakera_amount = amounts[0] if amounts else 0
         ouros_amount = amounts[1] if len(amounts) > 1 else 0
 
-        series, power, reason = '', 0, 'marriage'
+        series, power, reason = '', 0, parties.get('source') or 'marriage'
         pending = _PENDING_CLAIM
         if pending and (time.time() - float(pending.get('at') or 0)) < 180:
             pending_name = (pending.get('name') or '').strip()
@@ -607,28 +741,17 @@ def handle_mudae_chat(content, message_id=None):
             ):
                 series = pending.get('series') or ''
                 power = int(pending.get('power') or 0)
-                reason = pending.get('reason') or 'marriage'
+                reason = pending.get('reason') or reason
         _PENDING_CLAIM = None
 
-        WebDashboard.update_stats(
-            inc_kakera=kakera_amount,
-            inc_claims=1,
-            inc_ourospheres=ouros_amount,
-        )
-        WebDashboard.record_claim({
-            'name': character,
-            'series': series,
-            'power': power,
-            'kakera': kakera_amount,
-            'ourospheres': ouros_amount,
-            'reason': reason,
-            'ts': time.time(),
-        })
-        log_msg(
-            'CLAIM',
-            f"Свадьба! {character} · +{kakera_amount} kakera, +{ouros_amount} ourosphere "
-            f"(всего k={WebDashboard.BOT_STATS['kakera_earned']}, "
-            f"o={WebDashboard.BOT_STATS.get('ourospheres_earned', 0)}).",
+        _apply_claim_record(
+            character=character,
+            kakera=kakera_amount,
+            ouros=ouros_amount,
+            series=series,
+            power=power,
+            reason=reason,
+            source=parties.get('source') or 'marriage',
         )
         return {
             'type': 'marriage',
@@ -821,8 +944,10 @@ def _profile_log(state):
 
 _CARD_POWER_BOLD_RE = re.compile(r'\*\*([\d,]+)\*\*')
 # Цена персонажа: «24,290:kakera» без плюса. «+19,350:kakera:» — бонус ключей/$bku.
+# «**157**<:kakera:id>»: между числом и :kakera стоят ** и <.
+# «(**1**) $embedcolor» этим правилом не берётся — после 1 нет :kakera.
 _CARD_POWER_KAKERA_RE = re.compile(
-    rf'(?<![\d+,]){_AMOUNT}\s*:kakera:?',
+    rf'(?<![\d+,]){_AMOUNT}\**<?\s*:kakera:?',
     re.IGNORECASE,
 )
 _KEY_KAKERA_BONUS_RE = re.compile(
@@ -892,6 +1017,12 @@ def parse_card_embed(embed):
         card_power = _parse_amount(k_matches[-1].group('amount'))
     if not card_power:
         for match in _CARD_POWER_BOLD_RE.finditer(desc):
+            line_start = desc.rfind('\n', 0, match.start()) + 1
+            line_end = desc.find('\n', match.end())
+            if line_end < 0:
+                line_end = len(desc)
+            if '$embedcolor' in desc[line_start:line_end].lower():
+                continue
             card_power = _parse_amount(match.group(1))
             if card_power:
                 break
@@ -920,6 +1051,66 @@ def parse_card_embed(embed):
                 break
 
     return card_name, card_series, card_power, is_claimed
+
+
+def _card_identity(message_id, message=None):
+    """Имя, серия и цена из embed карточки. Пустые строки, если embed ещё нет."""
+    msg = message
+    if msg is None:
+        msg = _MESSAGE_CACHE.get(str(message_id or ''))
+    embeds = (msg or {}).get('embeds') or []
+    if not embeds:
+        return '', '', 0
+    name, series, power, _claimed = parse_card_embed(embeds[0])
+    if name == 'Неизвестно':
+        name = ''
+    if series == 'Неизвестно':
+        series = ''
+    return name, series, int(power or 0)
+
+
+def _pending_snapshot_for(message_id, embed_name):
+    """Pending-клейм этой карточки, если он ещё не устарел."""
+    pending = _PENDING_CLAIM
+    if not pending:
+        return None
+    if time.time() - float(pending.get('at') or 0) > 180:
+        return None
+    pending_id = str(pending.get('message_id') or '')
+    if pending_id and pending_id == str(message_id or ''):
+        return pending
+    if embed_name and _names_match(pending.get('name'), embed_name):
+        return pending
+    return None
+
+
+def _commit_from_card(profile_state, message_id, message=None, *, quiet=False):
+    """Записывает клейм по обновлённой карточке, если текстовое подтверждение ещё не пришло."""
+    global _PENDING_CLAIM
+    embed_name, embed_series, embed_power = _card_identity(message_id, message)
+    pending = _pending_snapshot_for(message_id, embed_name)
+    if pending:
+        name = (pending.get('name') or '').strip() or embed_name
+        series = pending.get('series') or embed_series
+        power = int(pending.get('power') or 0) or embed_power
+        reason = pending.get('reason') or 'card'
+    elif embed_name:
+        name, series, power, reason = embed_name, embed_series, embed_power, 'card'
+    else:
+        return 'skip'
+    if series == 'Неизвестно':
+        series = ''
+    status = _apply_claim_record(
+        character=name,
+        series=series,
+        power=power,
+        reason=reason,
+        source='card',
+        quiet=quiet,
+    )
+    if status == 'new' and pending and _PENDING_CLAIM is pending:
+        _PENDING_CLAIM = None
+    return status
 
 
 def parse_key_kakera_bonus(embed):
@@ -1120,7 +1311,7 @@ def sync_profile_state(state):
         target['current_threshold'] = compute_claim_threshold(
             target.get('claim_minutes_left', 0)
         )
-    WebDashboard.emit_profile_update(dict(Accounts.MAIN.profile))
+    WebDashboard.emit_profile_update(dict(target), account=account)
     WebDashboard.emit_swarm_accounts()
     return target
 
@@ -1363,6 +1554,11 @@ _RT_OK_RE = re.compile(
     re.IGNORECASE,
 )
 _CANT_CLAIM_RE = re.compile(r"you can'?t claim\b", re.IGNORECASE)
+# «you can claim once per interval of 3h. The next interval begins in 47 min.»
+_CLAIM_INTERVAL_RE = re.compile(
+    r'you can claim once per interval|next interval begins in',
+    re.IGNORECASE,
+)
 _CLAIM_CLICKS = {}
 
 
@@ -1530,8 +1726,12 @@ def _footer_owner_name(message):
     if not embeds:
         return ''
     footer = ((embeds[0].get('footer') or {}).get('text') or '')
-    match = re.search(r'belongs to\s+(.+)', footer, re.IGNORECASE)
-    return match.group(1).strip() if match else ''
+    match = _FOOTER_OWNER_RE.search(footer)
+    if not match:
+        return ''
+    owner = match.group(1).split('\n', 1)[0]
+    owner = re.sub(r'\s+', ' ', owner)
+    return _clean_party(owner)
 
 
 def _we_own_card(message):
@@ -1546,43 +1746,176 @@ def _refresh_card_message(channel_id, message_id):
     return fetched
 
 
+def _mark_owned_card(message):
+    """True, если футер карточки говорит, что она наша."""
+    mid = str((message or {}).get('id') or '')
+    if not mid or not _we_own_card(message):
+        return False
+    _OWNED_CARD_AT[mid] = time.time()
+    if len(_OWNED_CARD_AT) > 200:
+        oldest = sorted(_OWNED_CARD_AT, key=_OWNED_CARD_AT.get)[:100]
+        for key in oldest:
+            _OWNED_CARD_AT.pop(key, None)
+        _OWNED_CARD_AT[mid] = time.time()
+    return True
+
+
+def _owned_card_since(message_id, since):
+    at = float(_OWNED_CARD_AT.get(str(message_id or '')) or 0)
+    return at > 0 and at >= float(since or 0) - 0.5
+
+
+def _begin_active_claim(message_id, channel_id, profile_state):
+    _ACTIVE_CLAIM['message_id'] = str(message_id or '')
+    _ACTIVE_CLAIM['channel_id'] = str(channel_id or '')
+    _ACTIVE_CLAIM['since'] = time.time()
+    _ACTIVE_CLAIM['closed_at'] = 0.0
+    _ACTIVE_CLAIM['account_key'] = (profile_state or {}).get('account_key') or ''
+    _ACTIVE_CLAIM['last_fetch'] = 0.0
+
+
+def _end_active_claim(message_id):
+    if str(_ACTIVE_CLAIM.get('message_id') or '') != str(message_id or ''):
+        return
+    _ACTIVE_CLAIM['closed_at'] = time.time()
+
+
+def _accept_late_card_claim(message):
+    """Клик уже закончился отказом, а карточка всё же обновилась и стала нашей."""
+    mid = str((message or {}).get('id') or '')
+    if not mid or mid in _CLAIMED_OK:
+        return
+    closed = float(_ACTIVE_CLAIM.get('closed_at') or 0)
+    if not closed or time.time() - closed > 45:
+        return
+    if str(_ACTIVE_CLAIM.get('message_id') or '') != mid:
+        return
+    account = Accounts.by_key(_ACTIVE_CLAIM.get('account_key')) or _active_account()
+    name, _series, _power = _card_identity(mid, message)
+    log_msg('CLAIM', f"УСПЕХ: карточка обновлена, {name or 'персонаж'} теперь наш.")
+    _note_claimed_ok(mid)
+    account.profile['can_claim'] = False
+    sync_profile_state(account.profile)
+    WebDashboard.emit_buffer_clear()
+    _commit_from_card(account.profile, mid, message, quiet=True)
+    if _ROLL_SESSION.get('active'):
+        _finish_claim_success(account, mid)
+
+
+def observe_card_claim(message):
+    """Правка карточки с футером «Belongs to» — стабильный признак клейма.
+
+    Текст подтверждения зависит от языка аккаунта, футер карточки — нет.
+    """
+    if not isinstance(message, dict):
+        return
+    mid = str(message.get('id') or '')
+    if not mid:
+        return
+    if not message.get('embeds'):
+        active = str(_ACTIVE_CLAIM.get('message_id') or '')
+        if mid != active:
+            return
+        now = time.monotonic()
+        last = float(_ACTIVE_CLAIM.get('last_fetch') or 0)
+        if now - last < 0.45:
+            return
+        _ACTIVE_CLAIM['last_fetch'] = now
+        fresh = _refresh_card_message(_ACTIVE_CLAIM.get('channel_id'), mid)
+        if not fresh:
+            return
+        message = fresh
+        mid = str(message.get('id') or mid)
+    if not _mark_owned_card(message):
+        return
+    _accept_late_card_claim(message)
+
+
 def _our_marriage_since(since):
     """Свадьба уже разобрана (часто Gateway-потоком), а кнопка сердца ещё на месте."""
     return float(_LAST_OUR_MARRIAGE.get('at') or 0) >= float(since or 0) - 0.5
+
+
+def _seen_our_claim(message_id, since):
+    """Текст клейма уже разобран или футер карточки показывает, что она наша."""
+    if _our_marriage_since(since) or _owned_card_since(message_id, since):
+        return True
+    cached = _MESSAGE_CACHE.get(str(message_id or ''))
+    return bool(_mark_owned_card(cached))
+
+
+def _claim_block_reason(text):
+    """'spent' — клейм аккаунта уже потрачен. 'rejected' — разовый отказ. '' — тишина."""
+    if not text:
+        return ''
+    if _CLAIM_INTERVAL_RE.search(text):
+        return 'spent'
+    if _CANT_CLAIM_RE.search(text):
+        return 'rejected'
+    return ''
+
+
+def _consume_new_mudae_texts(last_id, channel_id):
+    """Разбирает новые ответы Mudae. Второй элемент — причина отказа или ''."""
+    reason = ''
+    newest = last_id
+    for mid, raw, text in _fetch_new_mudae_texts(last_id, channel_id):
+        if mid:
+            newest = mid
+        if raw:
+            handle_mudae_chat(raw, message_id=mid)
+        found = _claim_block_reason(text)
+        if found == 'spent' or (found and not reason):
+            reason = found
+    return newest, reason
 
 
 def _poll_claim_outcome(after_id, channel_id, message_id, *, since=None):
     """'ok' — наш клейм прошёл. 'lost' — карту забрали не мы. 'rejected' — сердце ещё живо.
 
     Сердце после свадьбы часто остаётся на карте. Это не отказ.
+    Надёжный признак — футер карточки «Belongs to», а не текст подтверждения.
     """
     started = time.monotonic()
     since = time.time() if since is None else since
     last_id = str(after_id or 0)
+
+    def _confirm_if_ours():
+        nonlocal last_id
+        if not _seen_our_claim(message_id, since):
+            return None
+        # Текст мог прийти вместе с правкой карточки — забираем kakera до записи.
+        last_id, block = _consume_new_mudae_texts(last_id, channel_id)
+        if block == 'spent' and not _seen_our_claim(message_id, since):
+            return 'spent'
+        if block and not _seen_our_claim(message_id, since):
+            return 'rejected'
+        return 'ok'
+
     while time.monotonic() - started < 2.4:
         human_sleep(0.35, 0.5, kind='action', log=False)
-        if _our_marriage_since(since):
+        confirmed = _confirm_if_ours()
+        if confirmed:
+            return confirmed
+        last_id, block = _consume_new_mudae_texts(last_id, channel_id)
+        if _seen_our_claim(message_id, since):
             return 'ok'
-        for mid, raw, text in _fetch_new_mudae_texts(last_id, channel_id):
-            if mid:
-                last_id = mid
-            if raw:
-                event = handle_mudae_chat(raw, message_id=mid)
-                if event and event.get('type') == 'marriage':
-                    return 'ok'
-            if text and _CANT_CLAIM_RE.search(text):
-                return 'rejected'
-        if _our_marriage_since(since):
-            return 'ok'
+        if block == 'spent':
+            return 'spent'
+        if block:
+            return 'rejected'
         fetched = _refresh_card_message(channel_id, message_id)
-        if fetched and _we_own_card(fetched):
+        if _mark_owned_card(fetched):
+            last_id, _refused = _consume_new_mudae_texts(last_id, channel_id)
             return 'ok'
         if fetched and _footer_owner_name(fetched) and not _we_own_card(fetched):
             return 'lost'
-    if _our_marriage_since(since):
-        return 'ok'
+    confirmed = _confirm_if_ours()
+    if confirmed:
+        return confirmed
     fetched = _refresh_card_message(channel_id, message_id)
-    if fetched and _we_own_card(fetched):
+    if _mark_owned_card(fetched):
+        last_id, _refused = _consume_new_mudae_texts(last_id, channel_id)
         return 'ok'
     if fetched and _footer_owner_name(fetched):
         return 'lost'
@@ -2173,6 +2506,36 @@ def _claim_card(
     card_power=0,
     allow_rt=False,
 ):
+    """Клик идёт токеном аккаунта из профиля, а не тем, кто сейчас крутит роллы."""
+    claimer = Accounts.by_key((profile_state or {}).get('account_key')) or _active_account()
+    with _use_account(claimer):
+        return _claim_card_for_active(
+            message_id,
+            reason,
+            profile_state,
+            message=message,
+            components=components,
+            channel_id=channel_id,
+            card_name=card_name,
+            card_series=card_series,
+            card_power=card_power,
+            allow_rt=allow_rt,
+        )
+
+
+def _claim_card_for_active(
+    message_id,
+    reason,
+    profile_state,
+    *,
+    message=None,
+    components=None,
+    channel_id=None,
+    card_name='',
+    card_series='',
+    card_power=0,
+    allow_rt=False,
+):
     """Клеймит карту: сначала кнопка-компонент, иначе реакция-эмодзи.
 
     message — полный объект Discord-сообщения (предпочтительно).
@@ -2234,58 +2597,73 @@ def _claim_card(
         series=series,
         power=power,
         reason=reason,
+        message_id=message_id,
     )
 
     log_msg('CLAIM', f"Причина клейма — {reason}. Пытаюсь заклеймить...", dim=True)
 
-    attempt_started = time.time()
-    while True:
-        if _our_marriage_since(attempt_started):
-            log_msg('CLAIM', "УСПЕХ: Mudae уже сообщила о свадьбе.")
-            _note_claimed_ok(message_id)
-            profile_state['can_claim'] = False
-            sync_profile_state(profile_state)
-            WebDashboard.emit_buffer_clear()
-            return True
-        clicks = _claim_click_count(message_id)
-        after_click = _get_latest_message_id()
-        clicked = _claim_via_button(msg, claim_button)
-        outcome = 'rejected'
-        if clicked:
-            outcome = _poll_claim_outcome(
-                after_click, resolved_channel, message_id, since=attempt_started,
+    def _succeed(fetched=None):
+        owned = _owned_card_since(message_id, attempt_started) or _we_own_card(fetched)
+        if owned and not _our_marriage_since(attempt_started):
+            card_name_now, _series_now, _power_now = _card_identity(message_id, fetched)
+            log_msg(
+                'CLAIM',
+                f"УСПЕХ: карточка обновлена, {card_name_now or name or 'персонаж'} теперь наш.",
             )
-        if outcome != 'ok' and _our_marriage_since(attempt_started):
-            outcome = 'ok'
-        if outcome == 'ok':
+        else:
             log_msg('CLAIM', "УСПЕХ: Mudae забрала персонажа.")
-            _note_claimed_ok(message_id)
-            profile_state['can_claim'] = False
-            sync_profile_state(profile_state)
-            WebDashboard.emit_buffer_clear()
-            return True
-        if outcome == 'lost':
-            log_msg('WARN', "Персонажа уже забрал кто-то другой. Клейм не списываю.")
-            return False
-        if clicks >= 3:
-            log_msg('WARN', "Три клика по сердцу не заклеймили персонажа. Останавливаюсь.")
-            return False
-        log_msg('WARN', "Клейм не прошёл. Жду и жму сердце ещё раз.", dim=True)
-        human_sleep(0.7, 1.1, kind='action', log=False)
-        msg, claim_button, resolved_channel, message_id = _await_claim_button(
-            msg, message_id, resolved_channel, None, timeout=1.4,
-        )
-        if not claim_button:
-            fetched = _refresh_card_message(resolved_channel, message_id)
-            if _our_marriage_since(attempt_started) or (fetched and _we_own_card(fetched)):
-                log_msg('CLAIM', "УСПЕХ: Mudae забрала персонажа.")
-                _note_claimed_ok(message_id)
+        _note_claimed_ok(message_id)
+        profile_state['can_claim'] = False
+        sync_profile_state(profile_state)
+        WebDashboard.emit_buffer_clear()
+        _commit_from_card(profile_state, message_id, fetched, quiet=True)
+        return True
+
+    attempt_started = time.time()
+    tracked_id = message_id
+    _begin_active_claim(tracked_id, resolved_channel, profile_state)
+    try:
+        while True:
+            if _seen_our_claim(message_id, attempt_started):
+                return _succeed()
+            clicks = _claim_click_count(message_id)
+            after_click = _get_latest_message_id()
+            clicked = _claim_via_button(msg, claim_button)
+            outcome = 'rejected'
+            if clicked:
+                outcome = _poll_claim_outcome(
+                    after_click, resolved_channel, message_id, since=attempt_started,
+                )
+            if outcome != 'ok' and _seen_our_claim(message_id, attempt_started):
+                outcome = 'ok'
+            if outcome == 'ok':
+                return _succeed()
+            if outcome == 'lost':
+                log_msg('WARN', "Персонажа уже забрал кто-то другой. Клейм не списываю.")
+                return False
+            if outcome == 'spent':
                 profile_state['can_claim'] = False
                 sync_profile_state(profile_state)
-                WebDashboard.emit_buffer_clear()
-                return True
-            log_msg('WARN', "Кнопка клейма исчезла до подтверждения. Повторю, если сообщение ещё раз обновят.")
-            return None
+                log_msg('WARN', "У этого аккаунта клейм уже потрачен в интервале. Останавливаюсь.")
+                return False
+            if clicks >= 3:
+                if _seen_our_claim(message_id, attempt_started):
+                    return _succeed()
+                log_msg('WARN', "Три клика по сердцу не заклеймили персонажа. Останавливаюсь.")
+                return False
+            log_msg('WARN', "Клейм не прошёл. Жду и жму сердце ещё раз.", dim=True)
+            human_sleep(0.7, 1.1, kind='action', log=False)
+            msg, claim_button, resolved_channel, message_id = _await_claim_button(
+                msg, message_id, resolved_channel, None, timeout=1.4,
+            )
+            if not claim_button:
+                fetched = _refresh_card_message(resolved_channel, message_id)
+                if _mark_owned_card(fetched) or _seen_our_claim(message_id, attempt_started):
+                    return _succeed(fetched)
+                log_msg('WARN', "Кнопка клейма исчезла до подтверждения. Повторю, если сообщение ещё раз обновят.")
+                return None
+    finally:
+        _end_active_claim(tracked_id)
 
 def _send_pokeslot():
     """Отправляет $p. Сбой сети не должен ронять поток расписания."""

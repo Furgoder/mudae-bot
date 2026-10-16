@@ -204,15 +204,26 @@ def snapshot():
     for account in ACCOUNTS:
         left = max(0, int(account.kakera_cooldown_until - now))
         ready_flag = account.profile.get('kakera_ready')
+        profile = account.profile
         rows.append({
             'key': account.key,
             'label': account.label,
             'role': account.role,
-            'can_claim': bool(account.profile.get('can_claim')),
-            'rt_ready': bool(account.profile.get('rt_ready')),
+            'can_claim': bool(profile.get('can_claim')),
+            'rt_ready': profile.get('rt_ready'),
+            'rt_minutes_left': int(profile.get('rt_minutes_left') or 0),
+            'daily_ready': profile.get('daily_ready'),
+            'daily_minutes_left': int(profile.get('daily_minutes_left') or 0),
+            'dk_ready': profile.get('dk_ready'),
+            'dk_minutes_left': int(profile.get('dk_minutes_left') or 0),
+            'claim_minutes_left': int(profile.get('claim_minutes_left') or 0),
+            'rolls_reset_minutes': int(profile.get('rolls_reset_minutes') or 0),
+            'rolls_resets': int(profile.get('rolls_resets') or 0),
+            'current_threshold': profile.get('current_threshold'),
+            'claim_ttl': profile.get('claim_ttl'),
             'kakera_ready': left <= 0 and ready_flag is not False,
             'kakera_seconds': left,
-            'rolls_left': int(account.profile.get('rolls_left') or 0),
+            'rolls_left': int(profile.get('rolls_left') or 0),
             'next_roll_at': account.next_roll_at,
             'last_session_seconds': account.last_session_seconds,
         })

@@ -199,6 +199,30 @@ def insert_claim(entry):
     return item
 
 
+def add_claim_rewards(claim_id, kakera=0, ourospheres=0):
+    """Дописывает kakera и ourosphere к уже сохранённому клейму."""
+    claim_id = int(claim_id or 0)
+    kakera = int(kakera or 0)
+    ourospheres = int(ourospheres or 0)
+    if claim_id <= 0 or (kakera <= 0 and ourospheres <= 0):
+        return False
+    init_db()
+    with _lock:
+        conn = _connect()
+        try:
+            conn.execute(
+                '''
+                UPDATE claims
+                SET kakera = kakera + ?, ourospheres = ourospheres + ?
+                WHERE id = ?
+                ''',
+                (kakera, ourospheres, claim_id),
+            )
+        finally:
+            conn.close()
+    return True
+
+
 def get_recent_claims(limit=200):
     """Последние N клеймов, новые сверху (для SocketIO / UI)."""
     init_db()

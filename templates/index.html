@@ -214,7 +214,7 @@
 
       <section class="rounded-2xl border border-white/5 bg-ink-900/80 backdrop-blur px-6 py-5">
         <div class="flex flex-wrap items-baseline justify-between gap-2 mb-4">
-          <h2 class="font-display text-lg font-bold text-white">Состояние профиля</h2>
+          <h2 class="font-display text-lg font-bold text-white">Состояние профиля <span id="profile-account-label" class="text-slate-400 font-normal"></span></h2>
           <p id="claim-threshold" class="text-sm text-slate-400">
             Клеймим при цене персонажа ≥ <span class="text-accent-mint font-semibold">—</span>
           </p>
@@ -578,13 +578,50 @@
       return `${Math.floor(total / 60)}м ${total % 60}с`;
     }
 
+    let swarmRows = [];
+    let selectedAccountKey = null;
+
+    function profileFromSwarmRow(row) {
+      return {
+        account_key: row.key,
+        label: row.label,
+        rolls_reset_minutes: row.rolls_reset_minutes,
+        rolls_left: row.rolls_left,
+        rolls_resets: row.rolls_resets,
+        claim_minutes_left: row.claim_minutes_left,
+        can_claim: row.can_claim,
+        rt_ready: row.rt_ready,
+        rt_minutes_left: row.rt_minutes_left,
+        daily_ready: row.daily_ready,
+        daily_minutes_left: row.daily_minutes_left,
+        dk_ready: row.dk_ready,
+        dk_minutes_left: row.dk_minutes_left,
+        current_threshold: row.current_threshold,
+        claim_ttl: row.claim_ttl,
+        skip_stamp: true,
+      };
+    }
+
+    function applySelectedProfile() {
+      const row = swarmRows.find((item) => item.key === selectedAccountKey);
+      if (!row) return;
+      const label = document.getElementById('profile-account-label');
+      if (label) label.textContent = row.label ? `· ${row.label}` : '';
+      applyProfile(profileFromSwarmRow(row));
+    }
+
     function renderSwarm(rows) {
       const root = document.getElementById('swarm-list');
       if (!root) return;
-      const list = Array.isArray(rows) ? rows : [];
+      if (Array.isArray(rows)) swarmRows = rows;
+      const list = swarmRows;
       if (!list.length) {
         root.innerHTML = '';
         return;
+      }
+      if (!selectedAccountKey || !list.some((item) => item.key === selectedAccountKey)) {
+        const main = list.find((item) => item.role === 'main');
+        selectedAccountKey = (main || list[0]).key;
       }
       root.innerHTML = list.map((row) => {
         const claim = row.can_claim ? 'клейм есть' : 'клейм в откате';
@@ -592,15 +629,19 @@
         const next = row.next_roll_at ? formatClock(row.next_roll_at) : '—';
         const lasted = formatDuration(row.last_session_seconds);
         const role = row.role === 'main' ? 'основной' : 'слейв';
+        const selected = row.key === selectedAccountKey;
+        const border = selected ? 'border-accent-mint/60' : 'border-white/5 hover:border-white/20';
         return `
-          <div class="rounded-xl bg-ink-800/80 px-4 py-3 border border-white/5">
+          <button type="button" data-account-key="${escapeHtml(row.key || '')}"
+            class="rounded-xl bg-ink-800/80 px-4 py-3 border ${border} text-left w-full transition">
             <p class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">${escapeHtml(role)}</p>
             <p class="font-display text-lg font-bold text-white truncate">${escapeHtml(row.label || row.key || '')}</p>
             <p class="text-[11px] text-slate-400 mt-1">роллов: ${escapeHtml(String(row.rolls_left ?? '—'))} · ${escapeHtml(claim)}</p>
             <p class="text-[11px] text-slate-400">${escapeHtml(kakera)}</p>
             <p class="text-[11px] text-slate-500 mt-1">далее ${escapeHtml(next)} · прошлая ${escapeHtml(lasted)}</p>
-          </div>`;
+          </button>`;
       }).join('');
+      applySelectedProfile();
     }
 
     function applyProfile(data) {
@@ -627,7 +668,7 @@
         applyConfig({ claim_ttl: data.claim_ttl });
       }
       if (data.updated_at != null) markDataUpdated(data.updated_at);
-      else markDataUpdated();
+      else if (!data.skip_stamp) markDataUpdated();
     }
 
     function formatClaimTime(ts) {
@@ -999,8 +1040,25 @@
       }
     });
 
-    socket.on('profile_update', applyProfile);
+    socket.on('profile_update', (data) => {
+      if (!data) return;
+      if (selectedAccountKey && data.account_key && data.account_key !== selectedAccountKey) return;
+      applyProfile(data);
+      const label = document.getElementById('profile-account-label');
+      if (label && data.label && (!selectedAccountKey || data.account_key === selectedAccountKey)) {
+        label.textContent = `· ${data.label}`;
+      }
+    });
     socket.on('swarm_update', renderSwarm);
+    const swarmRoot = document.getElementById('swarm-list');
+    if (swarmRoot) {
+      swarmRoot.addEventListener('click', (event) => {
+        const card = event.target.closest('[data-account-key]');
+        if (!card) return;
+        selectedAccountKey = card.getAttribute('data-account-key');
+        renderSwarm(swarmRows);
+      });
+    }
     socket.on('minigames_update', applyMinigames);
     socket.on('settings_update', applySettings);
     socket.on('vars_update', renderVarsForm);

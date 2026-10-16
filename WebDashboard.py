@@ -116,6 +116,14 @@ def record_claim(entry):
     return item
 
 
+def bump_claim_rewards(claim_id, kakera=0, ourospheres=0):
+    """Дописывает награду к клейму, который сначала увидели по карточке, без текста."""
+    if not Database.add_claim_rewards(claim_id, kakera=kakera, ourospheres=ourospheres):
+        return False
+    socketio.emit('claim_history_update', get_claim_history_payload())
+    return True
+
+
 def clear_claim_history():
     """Очищает историю клеймов в БД и сбрасывает счётчик сессии."""
     Database.clear_claims()
@@ -518,7 +526,7 @@ def emit_swarm_accounts(rows=None):
     return rows
 
 
-def emit_profile_update(state):
+def emit_profile_update(state, account=None):
     """Рассылает состояние профиля из $tu (profile_update)."""
     global LAST_PROFILE
 
@@ -530,6 +538,8 @@ def emit_profile_update(state):
         return None
 
     payload = {
+        'account_key': (getattr(account, 'key', None) or (state or {}).get('account_key') or ''),
+        'label': getattr(account, 'label', None) or '',
         'rolls_reset_minutes': int(state.get('rolls_reset_minutes', 0) or 0),
         'claim_minutes_left': int(state.get('claim_minutes_left', 0) or 0),
         'rolls_left': int(state.get('rolls_left', 0) or 0),

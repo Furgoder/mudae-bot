@@ -179,6 +179,9 @@ def sniper(resp):
     if channel_id not in _watch_channel_ids():
         return
 
+    # Футер карточки стабильнее текста клейма: язык аккаунта на него не влияет.
+    Function.observe_card_claim(message)
+
     # Реактивный парсер подтверждений (пока Gateway жив)
     handle_mudae_chat(message.get('content', ''), message_id=message.get('id'))
 
