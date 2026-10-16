@@ -749,7 +749,13 @@ def on_use_us_rolls(data=None):
     reset = now.replace(second=0, microsecond=0, minute=minute)
     if reset <= now:
         reset += timedelta(hours=1)
-    log_msg('ROLL', f'$us 20 × {times} ({rolls} роллов) поставлен в очередь.')
+    if Bot.roll_busy():
+        log_msg(
+            'ROLL',
+            f'$us 20 × {times} ({rolls} роллов) начнёт сразу после текущей крутки.',
+        )
+    else:
+        log_msg('ROLL', f'$us 20 × {times} ({rolls} роллов). Запускаю сейчас.')
     Bot.enqueue_roll('us', 'main', finish_by=reset, note=f'$us 20 × {times}', rolls=rolls)
     emit('action_result', {'ok': True, 'action': 'use_us_rolls', 'rolls': rolls})
 

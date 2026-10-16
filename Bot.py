@@ -28,6 +28,7 @@ _ROLL_WAKE = threading.Event()
 # Роллы и миниигры делят один канал. Пока замок занят, вторая активность ждёт.
 _CHANNEL_LOCK = threading.Lock()
 _mg_deferred = False
+_ROLL_BUSY = False
 
 
 next_oh_attempt = None
@@ -208,6 +209,33 @@ def enqueue_roll(kind, account_key='main', *, not_before=None, finish_by=None, n
     _ROLL_WAKE.set()
 
 
+def roll_busy():
+    """True, пока очередь выполняет уже снятую задачу."""
+    return _ROLL_BUSY
+
+
+def _urgent_waiting():
+    """$us и ручной прокрут должны обойти часовую крутку, которая ещё не началась."""
+    now = time.time()
+    with _ROLL_LOCK:
+        return any(
+            job['kind'] in ('us', 'force') and job['not_before'] <= now
+            for job in _ROLL_JOBS
+        )
+
+
+def _defer_job(job, reason):
+    log_msg('ROLL', reason, dim=True)
+    enqueue_roll(
+        job['kind'],
+        job['account'],
+        not_before=job['not_before'],
+        finish_by=job.get('finish_by'),
+        note=job.get('note') or '',
+        rolls=job.get('rolls'),
+    )
+
+
 def _publish_queued_locked():
     scheduled = [job for job in _ROLL_JOBS if job['kind'] == 'scheduled']
     if not scheduled:
@@ -255,6 +283,15 @@ def _schedule_next(account, *, after=None, fresh_hour=True):
 
 
 def _run_roll_job(job):
+    global _ROLL_BUSY
+    _ROLL_BUSY = True
+    try:
+        _run_roll_job_body(job)
+    finally:
+        _ROLL_BUSY = False
+
+
+def _run_roll_job_body(job):
     account = Accounts.by_key(job['account']) or Accounts.MAIN
     kind = job['kind']
     finish_by = job.get('finish_by')
@@ -281,13 +318,29 @@ def _run_roll_job(job):
 
 
 def _run_roll_job_locked(job, account, kind, finish_by, stop_before):
-    if kind in ('startup', 'force', 'us'):
+    urgent = kind in ('us', 'force')
+    if not urgent and _urgent_waiting():
+        _defer_job(job, f"{account.label}: в очереди $us, эту крутку оставляю на потом.")
+        return
+    if kind == 'us':
+        # Кнопка с панели не должна сидеть до ресета из-за чужого ролла.
+        quiet_deadline = None
+        max_wait = 15
+    elif kind in ('startup', 'force'):
         quiet_deadline = stop_before
         max_wait = None if quiet_deadline else 15 * 60
     else:
         quiet_deadline = stop_before
         max_wait = None
-    if not wait_channel_quiet(deadline=quiet_deadline, max_wait=max_wait):
+    quiet = wait_channel_quiet(
+        deadline=quiet_deadline,
+        max_wait=max_wait,
+        abort=None if urgent else _urgent_waiting,
+    )
+    if quiet is None:
+        _defer_job(job, f"{account.label}: в очереди $us, эту крутку оставляю на потом.")
+        return
+    if not quiet:
         log_msg('ROLL', f"{account.label}: эфир занят до конца окна, переношу крутку.")
         if kind == 'scheduled':
             _schedule_next(account, after=datetime.now(), fresh_hour=False)
@@ -326,11 +379,13 @@ def roll_worker():
         with _ROLL_LOCK:
             if not _ROLL_JOBS:
                 continue
-            _ROLL_JOBS.sort(key=lambda job: (job['not_before'], job['seq']))
-            nxt = _ROLL_JOBS[0]
-            if nxt['not_before'] > time.time():
+            now = time.time()
+            due = [job for job in _ROLL_JOBS if job['not_before'] <= now]
+            if not due:
                 continue
-            job = _ROLL_JOBS.pop(0)
+            due.sort(key=lambda job: (0 if job['kind'] in ('us', 'force') else 1, job['seq']))
+            job = due[0]
+            _ROLL_JOBS.remove(job)
             _publish_queued_locked()
         _run_roll_job(job)
 

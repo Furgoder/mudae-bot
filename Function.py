@@ -3105,10 +3105,11 @@ def _deadline_ts(deadline):
     return float(deadline)
 
 
-def wait_channel_quiet(deadline=None, max_wait=None):
+def wait_channel_quiet(deadline=None, max_wait=None, abort=None):
     """Ждёт, пока чужие роллы затихнут.
 
     False — упёрлись в ресет и крутить нельзя.
+    None — abort() попросил отпустить очередь.
     True — тихо, либо ждать дальше нельзя и сессию всё же можно продолжить.
     """
     lo = float(getattr(Vars, 'channel_quiet_min', 25) or 0)
@@ -3122,6 +3123,8 @@ def wait_channel_quiet(deadline=None, max_wait=None):
     started = time.monotonic()
     announced = False
     while True:
+        if abort is not None and abort():
+            return None
         if deadline_ts is not None and time.time() >= deadline_ts:
             log_msg('ROLL', 'До ресета роллов уже не успеть.')
             return False
