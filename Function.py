@@ -1277,7 +1277,7 @@ _CANT_CLAIM_RE = re.compile(r"you can'?t claim\b", re.IGNORECASE)
 _CLAIM_CLICKS = {}
 
 
-def _ensure_claim_ready(profile_state, allow_rt=False, channel_id=None):
+def _ensure_claim_ready(profile_state, allow_rt=False, channel_id=None, message_id=None):
     """Проверяет доступность клейма.
 
     $rt тратим только на вишлист и джекпот. После команды ждём, пока Mudae
@@ -1293,6 +1293,10 @@ def _ensure_claim_ready(profile_state, allow_rt=False, channel_id=None):
 
     if profile_state.get('rt_ready') is not True:
         log_msg('WARN', "Вишлист/джекпот, но клейм в откате и $rt недоступен. Реакция не отправлена.")
+        return False
+
+    if _rt_would_reclaim_ours(message_id, channel_id):
+        log_msg('CLAIM', "Этот персонаж уже заклеймлен. $rt не трачу.", dim=True)
         return False
 
     log_msg('CLAIM', "Клейм уже потрачен. $rt доступен — отправляю и жду сброс перед кнопкой.", dim=True)
@@ -2092,7 +2096,12 @@ def _claim_card(
         )
         return None
 
-    if not _ensure_claim_ready(profile_state, allow_rt=allow_rt, channel_id=resolved_channel):
+    if not _ensure_claim_ready(
+        profile_state,
+        allow_rt=allow_rt,
+        channel_id=resolved_channel,
+        message_id=message_id,
+    ):
         return False
 
     # После $rt Mudae часто пересобирает кнопки — берём свежий custom_id.
@@ -2131,6 +2140,7 @@ def _claim_card(
     while True:
         if _our_marriage_since(attempt_started):
             log_msg('CLAIM', "УСПЕХ: Mudae уже сообщила о свадьбе.")
+            _note_claimed_ok(message_id)
             profile_state['can_claim'] = False
             sync_profile_state(profile_state)
             WebDashboard.emit_buffer_clear()
@@ -2147,6 +2157,7 @@ def _claim_card(
             outcome = 'ok'
         if outcome == 'ok':
             log_msg('CLAIM', "УСПЕХ: Mudae забрала персонажа.")
+            _note_claimed_ok(message_id)
             profile_state['can_claim'] = False
             sync_profile_state(profile_state)
             WebDashboard.emit_buffer_clear()
@@ -2166,6 +2177,7 @@ def _claim_card(
             fetched = _refresh_card_message(resolved_channel, message_id)
             if _our_marriage_since(attempt_started) or (fetched and _we_own_card(fetched)):
                 log_msg('CLAIM', "УСПЕХ: Mudae забрала персонажа.")
+                _note_claimed_ok(message_id)
                 profile_state['can_claim'] = False
                 sync_profile_state(profile_state)
                 WebDashboard.emit_buffer_clear()
@@ -2196,6 +2208,7 @@ _ROLL_SESSION = {
     'limit_reached': False,
     'claim_spent': False,
     'claiming': False,
+    'claimed_msg_id': '',
     'claim_buffer': [],
     'profile_state': None,
     'current_threshold': 0.0,
@@ -2206,6 +2219,8 @@ _ROLL_SESSION = {
 _OWNER_BY_MESSAGE = {}
 _MESSAGE_CACHE = {}
 _CLAIM_DECIDED = set()
+_CLAIM_INFLIGHT = set()
+_CLAIMED_OK = set()
 _UNKNOWN_OWNER_LOGGED = set()
 _KAKERA_CD_LOGGED = set()
 _CLICKED_COMPONENTS = {}
@@ -2220,6 +2235,70 @@ def _remember_set(bucket, key, limit=400):
         bucket.clear()
     bucket.add(key)
     return True
+
+
+def _note_claimed_ok(message_id):
+    """Карта уже забрана нашим клеймом. Повтор этого сообщения не тратит $rt."""
+    mid = str(message_id or '')
+    if not mid:
+        return
+    with _ROLL_LOCK:
+        if len(_CLAIMED_OK) > 400:
+            _CLAIMED_OK.clear()
+        _CLAIMED_OK.add(mid)
+        _ROLL_SESSION['claimed_msg_id'] = mid
+
+
+def _rt_would_reclaim_ours(message_id, channel_id=None):
+    """True, если $rt ушёл бы в карту, которую мы уже заклеймили."""
+    mid = str(message_id or '')
+    with _ROLL_LOCK:
+        if mid and (mid in _CLAIMED_OK or mid == str(_ROLL_SESSION.get('claimed_msg_id') or '')):
+            return True
+    if not mid or not channel_id:
+        return False
+    fresh = _refresh_card_message(channel_id, mid)
+    if fresh and _we_own_card(fresh):
+        _note_claimed_ok(mid)
+        return True
+    return False
+
+
+def _begin_claim(mid):
+    """False — это сообщение уже клеймится или уже заклеймлено."""
+    if not mid:
+        return True
+    with _ROLL_LOCK:
+        if mid in _CLAIM_INFLIGHT or mid in _CLAIMED_OK or mid in _CLAIM_DECIDED:
+            return False
+        _CLAIM_INFLIGHT.add(mid)
+        return True
+
+
+def _end_claim(mid, result):
+    if not mid:
+        return
+    with _ROLL_LOCK:
+        _CLAIM_INFLIGHT.discard(mid)
+        if result:
+            if len(_CLAIMED_OK) > 400:
+                _CLAIMED_OK.clear()
+            _CLAIMED_OK.add(mid)
+            _ROLL_SESSION['claimed_msg_id'] = mid
+    if result is not None:
+        _remember_set(_CLAIM_DECIDED, mid)
+
+
+def _track_claim(mid, fn):
+    """Один клейм на сообщение. Правка Discord не запускает второй, пока первый жив."""
+    if mid and not _begin_claim(mid):
+        return False
+    result = None
+    try:
+        result = fn()
+    finally:
+        _end_claim(mid, result)
+    return result
 
 
 def _clicked_components(message_id):
@@ -2347,6 +2426,7 @@ def begin_roll_session(profile_state, current_threshold, jackpot_threshold):
         _ROLL_SESSION['limit_reached'] = False
         _ROLL_SESSION['claim_spent'] = False
         _ROLL_SESSION['claiming'] = False
+        _ROLL_SESSION['claimed_msg_id'] = ''
         _ROLL_SESSION['claim_buffer'] = []
         _ROLL_SESSION['profile_state'] = profile_state
         _ROLL_SESSION['current_threshold'] = float(current_threshold)
@@ -2423,19 +2503,33 @@ def _refresh_buffered_card(message):
 
 def _claim_from_session(message, reason, *, allow_rt, name, series, power, clear_buffer=False):
     """Клейм своей карты. Если буфер уже клеймит, ждём его и потом решаем."""
+    message_id = str(message.get('id') or '')
     deadline = time.monotonic() + 8
     while True:
+        skip_same = False
         with _ROLL_LOCK:
             if not _ROLL_SESSION['active']:
                 return False
             if not _ROLL_SESSION['claiming']:
-                if _ROLL_SESSION['claim_spent'] and not allow_rt:
-                    return False
-                _ROLL_SESSION['claiming'] = True
-                profile = _session_profile()
-                if clear_buffer:
-                    _ROLL_SESSION['claim_buffer'] = []
-                break
+                # Джекпот включает allow_rt. Это не повод второй раз клеймить
+                # ту же карту и сжигать $rt после уже успешного свободного клейма.
+                if message_id and message_id == str(_ROLL_SESSION.get('claimed_msg_id') or ''):
+                    skip_same = True
+                else:
+                    if _ROLL_SESSION['claim_spent'] and not allow_rt:
+                        return False
+                    _ROLL_SESSION['claiming'] = True
+                    profile = _session_profile()
+                    if clear_buffer:
+                        _ROLL_SESSION['claim_buffer'] = []
+                    break
+        if skip_same:
+            log_msg(
+                'CLAIM',
+                'Этот персонаж уже заклеймлен свободным клеймом. $rt не трачу.',
+                dim=True,
+            )
+            return False
         if time.monotonic() > deadline:
             return None
         time.sleep(0.05)
@@ -2456,10 +2550,15 @@ def _claim_from_session(message, reason, *, allow_rt, name, series, power, clear
         )
     finally:
         with _ROLL_LOCK:
-            _ROLL_SESSION['claiming'] = False
             if success:
                 _ROLL_SESSION['claim_spent'] = True
+                if message_id:
+                    _ROLL_SESSION['claimed_msg_id'] = message_id
+                    if len(_CLAIMED_OK) > 400:
+                        _CLAIMED_OK.clear()
+                    _CLAIMED_OK.add(message_id)
                 _ROLL_SESSION['claim_buffer'] = []
+            _ROLL_SESSION['claiming'] = False
     if success:
         WebDashboard.emit_buffer_clear()
     return success
@@ -2516,9 +2615,15 @@ def process_roll_claim_buffer(force=False):
         )
     finally:
         with _ROLL_LOCK:
-            _ROLL_SESSION['claiming'] = False
             if success:
                 _ROLL_SESSION['claim_spent'] = True
+                claimed_id = str(best.get('msg_id') or '')
+                if claimed_id:
+                    _ROLL_SESSION['claimed_msg_id'] = claimed_id
+                    if len(_CLAIMED_OK) > 400:
+                        _CLAIMED_OK.clear()
+                    _CLAIMED_OK.add(claimed_id)
+            _ROLL_SESSION['claiming'] = False
 
 
 def _buffer_own_card(message, name, series, power, threshold):
@@ -2595,11 +2700,8 @@ def _consider_own_claim(message):
             float(Vars.min_power_threshold) * float(getattr(Vars, 'jackpot_multiplier', 3)),
             threshold * float(getattr(Vars, 'jackpot_threshold_factor', 1.5)),
         )
-        result = False
-        attempted = False
         if our_wish or power >= jackpot_threshold:
-            attempted = True
-            result = _claim_card(
+            _track_claim(mid, lambda: _claim_card(
                 message.get('id'),
                 _priority_claim_reason(our_wish, name, power, jackpot_threshold),
                 profile,
@@ -2608,10 +2710,10 @@ def _consider_own_claim(message):
                 card_series=series,
                 card_power=power,
                 allow_rt=True,
-            )
-        elif series in Vars.desiredSeries:
-            attempted = True
-            result = _claim_card(
+            ))
+            return
+        if series in Vars.desiredSeries:
+            _track_claim(mid, lambda: _claim_card(
                 message.get('id'),
                 f"совпадение по серии: '{series}'",
                 profile,
@@ -2619,10 +2721,10 @@ def _consider_own_claim(message):
                 card_name=name,
                 card_series=series,
                 card_power=power,
-            )
-        elif power >= threshold:
-            attempted = True
-            result = _claim_card(
+            ))
+            return
+        if power >= threshold:
+            _track_claim(mid, lambda: _claim_card(
                 message.get('id'),
                 f"своя карта цена {power} >= {threshold:g}",
                 profile,
@@ -2630,15 +2732,14 @@ def _consider_own_claim(message):
                 card_name=name,
                 card_series=series,
                 card_power=power,
-            )
-        if attempted and result is None:
+            ))
             return
         if mid:
             _remember_set(_CLAIM_DECIDED, mid)
         return
 
     if our_wish or power >= jackpot_threshold:
-        result = _claim_from_session(
+        _track_claim(mid, lambda: _claim_from_session(
             message,
             _priority_claim_reason(our_wish, name, power, jackpot_threshold),
             allow_rt=True,
@@ -2646,18 +2747,14 @@ def _consider_own_claim(message):
             series=series,
             power=power,
             clear_buffer=True,
-        )
-        if result is None:
-            return
-        if mid:
-            _remember_set(_CLAIM_DECIDED, mid)
+        ))
         return
     if claim_spent:
         if mid:
             _remember_set(_CLAIM_DECIDED, mid)
         return
     if series in Vars.desiredSeries:
-        result = _claim_from_session(
+        _track_claim(mid, lambda: _claim_from_session(
             message,
             f"совпадение по серии: '{series}'",
             allow_rt=False,
@@ -2665,11 +2762,7 @@ def _consider_own_claim(message):
             series=series,
             power=power,
             clear_buffer=True,
-        )
-        if result is None:
-            return
-        if mid:
-            _remember_set(_CLAIM_DECIDED, mid)
+        ))
         return
     if power >= threshold:
         _buffer_own_card(message, name, series, power, threshold)
