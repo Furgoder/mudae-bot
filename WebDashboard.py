@@ -1,5 +1,6 @@
 """Локальный веб-дашборд: Flask + SocketIO для логов, метрик и управления."""
 
+import json
 import os
 import re
 import ast
@@ -25,7 +26,7 @@ _VARS_PATH = Path(__file__).resolve().parent / 'Vars.py'
 
 # Порядок и группировка ключей при записи Vars.py / отрисовке формы
 VAR_SECTIONS = [
-    ('Discord', ['token', 'channelId', 'serverId', 'username']),
+    ('Discord', ['token', 'channelId', 'serverId', 'username', 'slaves']),
     ('Снайпинг', ['snipeEnabled', 'snipeChannelIds', 'snipe_roll_ignore_window', 'gateway_capabilities']),
     ('Миниигры', ['ouroMinigamesEnabled']),
     ('Роллы и клейм', [
@@ -44,6 +45,7 @@ VAR_SECTIONS = [
         'action_delay_min', 'action_delay_max',
         'minigame_gap_min', 'minigame_gap_max',
         'schedule_jitter_max', 'minigame_cd_jitter_max',
+        'roll_window_margin_sec', 'channel_quiet_min', 'channel_quiet_max',
         'sleep_mode_enabled', 'sleep_time_start', 'sleep_time_end',
     ]),
 ]
@@ -80,7 +82,7 @@ _SLEEP_KIND_LABELS = {
 }
 
 LOG_CACHE = deque(maxlen=4000)
-_LOG_DIR = Path(__file__).resolve().parent / 'logs'
+_LOG_DIR = Path(os.environ.get('MUDAE_DATA_DIR', Path(__file__).resolve().parent)) / 'logs'
 
 
 def _load_claim_history():
@@ -284,6 +286,8 @@ def get_vars_payload():
         values[key] = _json_safe_value(key, value)
         if isinstance(value, bool):
             type_map[key] = 'bool'
+        elif key == 'slaves':
+            type_map[key] = 'literal'
         elif isinstance(value, list):
             type_map[key] = 'list'
         elif isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -316,6 +320,9 @@ def get_vars_payload():
 
 def _format_py_value(key, value):
     """Сериализация Python-литерала для Vars.py."""
+    if key == 'slaves':
+        items = value if isinstance(value, list) else []
+        return repr(items)
     if isinstance(value, bool):
         return 'True' if value else 'False'
     if isinstance(value, list):
@@ -341,8 +348,37 @@ def _format_py_value(key, value):
     return repr(str(value))
 
 
+def _coerce_slaves(value):
+    if isinstance(value, str):
+        text = value.strip() or '[]'
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = ast.literal_eval(text)
+    elif isinstance(value, list):
+        parsed = value
+    else:
+        parsed = []
+    result = []
+    if not isinstance(parsed, list):
+        return result
+    for item in parsed:
+        if isinstance(item, dict):
+            token = str(item.get('token') or '').strip()
+            username = str(item.get('username') or '').strip()
+        elif isinstance(item, str):
+            token, username = item.strip(), ''
+        else:
+            continue
+        if token:
+            result.append({'token': token, 'username': username})
+    return result
+
+
 def _coerce_incoming_value(key, value, current):
     """Приводит значение из JSON формы к типу текущей переменной Vars."""
+    if key == 'slaves':
+        return _coerce_slaves(value)
     if isinstance(current, bool):
         if isinstance(value, bool):
             return value
@@ -446,7 +482,7 @@ def persist_var_to_file(key, value):
 def _append_log_file(payload):
     """Дневной файл, чтобы рестарт и буфер панели не стирали историю."""
     try:
-        _LOG_DIR.mkdir(exist_ok=True)
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
         day = time.strftime('%Y-%m-%d')
         path = _LOG_DIR / f'events-{day}.log'
         line = f"[{payload.get('time', '')}] [{payload.get('tag', '')}] {payload.get('message', '')}\n"
@@ -471,6 +507,15 @@ def emit_buffer_card(card):
 
 def emit_buffer_clear():
     socketio.emit('buffer_clear', {})
+
+
+def emit_swarm_accounts(rows=None):
+    """Состояние каждого аккаунта роя для панели."""
+    if rows is None:
+        import Accounts
+        rows = Accounts.snapshot()
+    socketio.emit('swarm_update', rows)
+    return rows
 
 
 def emit_profile_update(state):
@@ -543,6 +588,7 @@ def on_connect():
     emit('claim_history_update', get_claim_history_payload())
     if LAST_PROFILE:
         emit('profile_update', LAST_PROFILE)
+    emit_swarm_accounts()
     emit('minigames_update', LAST_MINIGAMES)
     with _log_lock:
         history = list(LOG_CACHE)
@@ -678,23 +724,34 @@ def on_force_tu_update(_data=None):
 
 @socketio.on('force_roll')
 def on_force_roll(_data=None):
-    def _run():
-        try:
-            import Bot
-            from Function import simpleRoll, log_msg
-            log_msg('ROLL', 'Принудительный прокрут из веб-панели...')
-            simpleRoll()
-            Bot.publish_next_roll(note='после ручного прокрута')
-        except Exception as error:
-            emit_log({
-                'tag': 'WARN',
-                'message': f'Ошибка принудительного прокрута: {error}',
-                'time': time.strftime('%H:%M:%S', time.localtime()),
-                'dim': False,
-            })
-
-    threading.Thread(target=_run, daemon=True, name='force_roll').start()
+    import Bot
+    from Function import log_msg
+    log_msg('ROLL', 'Принудительный прокрут поставлен в очередь.')
+    Bot.enqueue_roll('force', 'main', note='панель')
     emit('action_result', {'ok': True, 'action': 'force_roll'})
+
+
+@socketio.on('use_us_rolls')
+def on_use_us_rolls(data=None):
+    """Несколько $us 20 в ту же очередь. Стоп — ближайший ресет, чтобы не пересечь его."""
+    from datetime import datetime, timedelta
+    import Bot
+    from Function import log_msg
+    try:
+        rolls = int((data or {}).get('rolls') or 20)
+    except (TypeError, ValueError):
+        rolls = 20
+    rolls = max(20, ((max(rolls, 1) + 19) // 20) * 20)
+    rolls = min(rolls, 400)
+    times = rolls // 20
+    minute = Bot._repeat_minute()
+    now = datetime.now()
+    reset = now.replace(second=0, microsecond=0, minute=minute)
+    if reset <= now:
+        reset += timedelta(hours=1)
+    log_msg('ROLL', f'$us 20 × {times} ({rolls} роллов) поставлен в очередь.')
+    Bot.enqueue_roll('us', 'main', finish_by=reset, note=f'$us 20 × {times}', rolls=rolls)
+    emit('action_result', {'ok': True, 'action': 'use_us_rolls', 'rolls': rolls})
 
 
 @socketio.on('force_minigames')
@@ -704,9 +761,7 @@ def on_force_minigames(_data=None):
             import Bot
             from Function import log_msg
             log_msg('ROLL', 'Принудительный запуск миниигр из веб-панели...')
-            Bot.next_oh_attempt = None
-            Bot.next_oc_attempt = None
-            Bot.next_oq_attempt = None
+            Bot.reset_minigame_timers()
             previous = getattr(Vars, 'ouroMinigamesEnabled', True)
             Vars.ouroMinigamesEnabled = True
             try:

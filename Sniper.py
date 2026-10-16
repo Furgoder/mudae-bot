@@ -2,6 +2,7 @@ import threading
 import time
 
 import Vars
+import Accounts
 import Function
 from Function import (
     PROFILE_STATE,
@@ -61,8 +62,8 @@ def _claim_reaction(channel_id, message_id, message=None, allow_rt=False):
 
 
 def _snipe_kakera(message):
-    """Жмёт какеру и ourosphere на чужих роллах. Сфера не зависит от КД какеры."""
-    click_card_loot(message, log_prefix='СНАЙП КАКЕРЫ')
+    """Жмёт какеру и ourosphere на чужих роллах. Только основной аккаунт."""
+    click_card_loot(message, log_prefix='СНАЙП КАКЕРЫ', only_account=Accounts.MAIN)
 
 
 def _safe_subscribe_guild_events():
@@ -128,9 +129,25 @@ def _safe_subscribe_guild_events():
     Function.GATEWAY_LISTENING.set()
 
 
+def _reaction_add(resp):
+    raw = getattr(resp, 'raw', None) or {}
+    if raw.get('t') != 'MESSAGE_REACTION_ADD':
+        return False
+    data = raw.get('d') or {}
+    emoji = data.get('emoji') or {}
+    Function.note_us_reaction(
+        data.get('message_id'),
+        data.get('user_id'),
+        emoji.get('name'),
+    )
+    return True
+
+
 @bot.gateway.command
 def sniper(resp):
     """Слушает MESSAGE_CREATE / MESSAGE_UPDATE: чат-парсер + снайп карт/какеры."""
+    if _reaction_add(resp):
+        return
     # Подписка только после READY_SUPPLEMENTAL (тогда gateway.READY=True)
     if resp.event.ready_supplemental:
         log_msg('SYS', "Gateway READY — подписываюсь на события гильдий...", dim=True)

@@ -8,7 +8,7 @@ import time
 
 import requests
 import Vars
-from Function import auth, bot, botID, url, log_msg, human_sleep, action_pause
+from Function import botID, url, log_msg, human_sleep, action_pause, _active_account
 
 
 def _mg_log(message):
@@ -245,9 +245,17 @@ def _pick_harvest_target(buttons, prefer_cell, warned_unknown):
     return target, reason
 
 
+def _headers():
+    return _active_account().auth
+
+
+def _client():
+    return _active_account().client
+
+
 def _get_message(message_id):
     """Находит сообщение в доступной self-боту истории канала."""
-    response = requests.get(url, headers=auth, params={'limit': 10}, timeout=5)
+    response = requests.get(url, headers=_headers(), params={'limit': 10}, timeout=5)
     response.raise_for_status()
     return next(
         (message for message in response.json() if str(message.get('id')) == str(message_id)),
@@ -273,7 +281,7 @@ def _wait_for_minigame_message(after_message_id, timeout=10):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            response = requests.get(url, headers=auth, params={'limit': 25}, timeout=5)
+            response = requests.get(url, headers=_headers(), params={'limit': 25}, timeout=5)
             response.raise_for_status()
             for message in response.json():
                 rows = message.get('components', [])
@@ -720,7 +728,7 @@ def _play_ouroharvest_once():
     _mg_log('[bold cyan]Ouroharvest: отправляю $oh.[/bold cyan]')
     try:
         action_pause()
-        response = requests.post(url, headers=auth, json={'content': '$oh'}, timeout=5)
+        response = requests.post(url, headers=_headers(), json={'content': '$oh'}, timeout=5)
         response.raise_for_status()
     except requests.RequestException as error:
         _mg_log(f'[bold red]Не удалось отправить $oh: {error}[/bold red]')
@@ -781,7 +789,7 @@ def _play_ouroharvest_once():
         previous_content = message.get('content') or ''
         try:
             action_pause()
-            bot.click(
+            _client().click(
                 botID,
                 channelID=Vars.channelId,
                 guildID=Vars.serverId,
@@ -861,7 +869,7 @@ def _play_ourochest_once():
     _mg_log('[bold cyan]Ourochest: отправляю $oc.[/bold cyan]')
     try:
         action_pause()
-        response = requests.post(url, headers=auth, json={'content': '$oc'}, timeout=5)
+        response = requests.post(url, headers=_headers(), json={'content': '$oc'}, timeout=5)
         response.raise_for_status()
     except requests.RequestException as error:
         _mg_log(f'[bold red]Не удалось отправить $oc: {error}[/bold red]')
@@ -946,7 +954,7 @@ def _play_ourochest_once():
         previous_components = _components_snapshot(message)
         try:
             action_pause()
-            bot.click(
+            _client().click(
                 botID,
                 channelID=Vars.channelId,
                 guildID=Vars.serverId,
@@ -1036,7 +1044,7 @@ def _play_ouroquest_once():
     _mg_log('[bold cyan]Ouroquest: отправляю $oq.[/bold cyan]')
     try:
         action_pause()
-        response = requests.post(url, headers=auth, json={'content': '$oq'}, timeout=5)
+        response = requests.post(url, headers=_headers(), json={'content': '$oq'}, timeout=5)
         response.raise_for_status()
     except requests.RequestException as error:
         _mg_log(f'[bold red]Не удалось отправить $oq: {error}[/bold red]')
@@ -1115,7 +1123,7 @@ def _play_ouroquest_once():
         previous_components = _components_snapshot(message)
         try:
             action_pause()
-            bot.click(
+            _client().click(
                 botID,
                 channelID=Vars.channelId,
                 guildID=Vars.serverId,

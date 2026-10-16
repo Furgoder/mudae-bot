@@ -1,13 +1,16 @@
 """SQLite-хранилище истории клеймов и накопленных метрик сессии."""
 
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
 from threading import Lock
 
-DB_PATH = Path(__file__).resolve().parent / 'mudae_history.db'
-_JSON_HISTORY_PATH = Path(__file__).resolve().parent / 'claim_history.json'
+_ROOT = Path(__file__).resolve().parent
+_DATA_DIR = Path(os.environ.get('MUDAE_DATA_DIR', str(_ROOT)))
+DB_PATH = _DATA_DIR / 'mudae_history.db'
+_JSON_HISTORY_PATH = _ROOT / 'claim_history.json'
 _lock = Lock()
 
 _SESSION_KEYS = (
@@ -21,6 +24,7 @@ _initialized = False
 
 
 def _connect():
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), timeout=15, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute('PRAGMA journal_mode=WAL')
@@ -76,6 +80,15 @@ def init_db():
             )
             conn.execute(
                 'INSERT OR IGNORE INTO session_stats (id) VALUES (1)'
+            )
+            conn.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS roll_sessions (
+                    account_key TEXT PRIMARY KEY,
+                    seconds REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                '''
             )
             _migrate_json_history(conn)
             _bootstrap_stats_from_claims(conn)
@@ -235,6 +248,42 @@ def load_session_stats():
     if not row:
         return {key: 0 for key in _SESSION_KEYS}
     return {key: int(row[key] or 0) for key in _SESSION_KEYS}
+
+
+def load_roll_durations():
+    """Последняя длина сессии роллов по ключу аккаунта."""
+    init_db()
+    with _lock:
+        conn = _connect()
+        try:
+            rows = conn.execute(
+                'SELECT account_key, seconds FROM roll_sessions'
+            ).fetchall()
+        finally:
+            conn.close()
+    return {str(row['account_key']): float(row['seconds'] or 0) for row in rows}
+
+
+def save_roll_duration(account_key, seconds):
+    """Запоминает, сколько длилась часовая сессия этого аккаунта."""
+    init_db()
+    key = str(account_key or 'main')
+    value = max(0.0, float(seconds or 0))
+    with _lock:
+        conn = _connect()
+        try:
+            conn.execute(
+                '''
+                INSERT INTO roll_sessions (account_key, seconds, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(account_key) DO UPDATE SET
+                    seconds = excluded.seconds,
+                    updated_at = excluded.updated_at
+                ''',
+                (key, value, time.time()),
+            )
+        finally:
+            conn.close()
 
 
 def save_session_stats(stats):

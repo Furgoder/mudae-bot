@@ -9,6 +9,9 @@ token = 'YOUR_DISCORD_TOKEN_HERE'
 channelId = 'YOUR_CHANNEL_ID_HERE'
 serverId = 'YOUR_SERVER_ID_HERE'
 username = ''
+# Слейвы крутят свои роллы и забирают клейм/какеру, если у основного нет силы.
+# [{'token': 'TOKEN', 'username': ''}]
+slaves = []
 
 # --- Снайпинг ---
 snipeEnabled = False
@@ -58,8 +61,13 @@ action_delay_max = 1.1
 # Пауза между минииграми / раундами
 minigame_gap_min = 1.5
 minigame_gap_max = 4.0
-# Случайный сдвиг старта роллов после :repeatMinute (сек)
+# Старый джиттер старта. Роллы теперь стартуют в окне после ресета, это поле на них не влияет.
 schedule_jitter_max = 90
+# Запас до следующего ресета: сессия не начинается, если не успеет закончиться.
+roll_window_margin_sec = 90
+# Сколько секунд тишины ждать, прежде чем считать канал свободным.
+channel_quiet_min = 25
+channel_quiet_max = 50
 # Джиттер поверх кулдауна миниигр (сек)
 minigame_cd_jitter_max = 120
 # Ночной простой: не крутить роллы и миниигры в интервале (через полночь ок)

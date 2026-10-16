@@ -1,4 +1,3 @@
-import discum
 import json
 import random
 import re
@@ -8,7 +7,33 @@ import requests
 import Vars
 from discum.utils.slash import SlashCommander
 
+import Accounts
 import WebDashboard
+
+_ACCOUNT_LOCAL = threading.local()
+
+
+def _use_account(account):
+    """На время блока команды и клики идут от этого аккаунта."""
+    class _Ctx:
+        def __enter__(self):
+            self._prev = getattr(_ACCOUNT_LOCAL, 'account', None)
+            _ACCOUNT_LOCAL.account = account or Accounts.MAIN
+            return _ACCOUNT_LOCAL.account
+
+        def __exit__(self, exc_type, exc, tb):
+            if self._prev is None:
+                if hasattr(_ACCOUNT_LOCAL, 'account'):
+                    del _ACCOUNT_LOCAL.account
+            else:
+                _ACCOUNT_LOCAL.account = self._prev
+            return False
+
+    return _Ctx()
+
+
+def _active_account():
+    return getattr(_ACCOUNT_LOCAL, 'account', None) or Accounts.MAIN
 
 
 def human_delay(lo, hi=None):
@@ -88,40 +113,23 @@ def set_next_roll_at(when):
     WebDashboard.emit_timing(next_roll_at=ts)
     return ts
 
-botID = '432610292342587392' # ID бота Mudae
-auth = {'authorization': Vars.token}
-bot = discum.Client(token=Vars.token, log=False)
-# User-клиент discum: урезаем identify (без лишних activities) — слушаем сообщения.
-bot.gateway.auth['presence'] = {
-    'status': 'online',
-    'since': 0,
-    'activities': [],
-    'afk': False,
-}
-# capabilities: базовый набор без тяжёлых guild-features (discum default=509)
-bot.gateway.auth['capabilities'] = int(getattr(Vars, 'gateway_capabilities', 253))
+botID = Accounts.MUDAE_BOT_ID
+bot = Accounts.MAIN.client
+auth = Accounts.MAIN.auth
 
 url = f'https://discord.com/api/v9/channels/{Vars.channelId}/messages'
 
 # Время последнего собственного слэш-ролла (чтобы Sniper не перехватывал ответ Mudae)
 LAST_OUR_ROLL_TIME = 0.0
 
-# Локальный кэш профиля из $tu — для снайпера и порога клейма
-PROFILE_STATE = {
-    'can_claim': False,
-    'rt_ready': False,
-    'claim_minutes_left': 0,
-    'rolls_left': 0,
-    'current_threshold': float(getattr(Vars, 'min_power_threshold', 80)),
-    'kakera_power': 0,
-    'kakera_cost': 0,
-    'kakera_cost_keys': 0,
-    'kakera_power_full': False,
-    'kakera_ready': True,
-}
+# Профиль основного аккаунта. Тот же dict, что Accounts.MAIN.profile.
+PROFILE_STATE = Accounts.MAIN.profile
 
-# Не кликать какеру до этого unix-timestamp (после отказа Mudae)
+# Зеркало кулдауна основного. Читатели ходят в аккаунт через kakera_on_cooldown().
 KAKERA_COOLDOWN_UNTIL = 0.0
+
+# Последняя чужая карта в нашем канале (эфир занят).
+LAST_FOREIGN_ROLL_AT = 0.0
 
 # $rolls можно тратить только один раз за интервал сброса роллов
 ROLLS_RESET_USED_UNTIL = 0.0
@@ -136,25 +144,30 @@ _ROLLS_INTERVAL_TIME_RE = re.compile(
 )
 
 
-def rolls_reset_on_cooldown():
-    return time.time() < ROLLS_RESET_USED_UNTIL
+def rolls_reset_on_cooldown(account=None):
+    account = account or _active_account()
+    return time.time() < account.rolls_reset_used_until
 
 
-def rolls_reset_cooldown_left_seconds():
-    return max(0, int(ROLLS_RESET_USED_UNTIL - time.time()))
+def rolls_reset_cooldown_left_seconds(account=None):
+    account = account or _active_account()
+    return max(0, int(account.rolls_reset_used_until - time.time()))
 
 
-def _set_rolls_reset_cooldown(minutes, *, reason=''):
+def _set_rolls_reset_cooldown(minutes, *, reason='', account=None):
     """Блокирует повторный $rolls до конца текущего интервала."""
     global ROLLS_RESET_USED_UNTIL
+    account = account or _active_account()
     minutes = max(1, int(minutes or 0))
-    ROLLS_RESET_USED_UNTIL = time.time() + minutes * 60
+    account.rolls_reset_used_until = time.time() + minutes * 60
+    if account.is_main:
+        ROLLS_RESET_USED_UNTIL = account.rolls_reset_used_until
     suffix = f" ({reason})" if reason else ''
     log_msg(
         'ROLL',
-        f"$rolls уже использован в этом интервале{suffix}. "
+        f"$rolls уже использован в этом интервале{suffix} ({account.label}). "
         f"Следующий через {minutes} мин "
-        f"(до {time.strftime('%H:%M:%S', time.localtime(ROLLS_RESET_USED_UNTIL))}).",
+        f"(до {time.strftime('%H:%M:%S', time.localtime(account.rolls_reset_used_until))}).",
     )
 
 
@@ -238,18 +251,36 @@ def _remember_message_id(message_id, *, limit=2500):
     return True
 
 
-def kakera_on_cooldown():
-    return time.time() < KAKERA_COOLDOWN_UNTIL
+def _set_kakera_cooldown(until, account=None):
+    """Ставит кулдаун реакции конкретному аккаунту. У основного обновляет и глобал."""
+    global KAKERA_COOLDOWN_UNTIL
+    account = account or _active_account()
+    account.kakera_cooldown_until = float(until or 0)
+    if account.is_main:
+        KAKERA_COOLDOWN_UNTIL = account.kakera_cooldown_until
 
 
-def kakera_cooldown_left_seconds():
-    return max(0, int(KAKERA_COOLDOWN_UNTIL - time.time()))
+def kakera_on_cooldown(account=None):
+    account = account or _active_account()
+    return time.time() < account.kakera_cooldown_until
+
+
+def kakera_cooldown_left_seconds(account=None):
+    account = account or _active_account()
+    return max(0, int(account.kakera_cooldown_until - time.time()))
+
+
+def account_reaction_ready(account):
+    """Силы на реакцию хватает. Смотрит профиль этого аккаунта, не общий глобал."""
+    return not reaction_energy_missing(account.profile)
 
 
 def reaction_energy_missing(state=None):
     """Силы на реакцию нет: кулдаун Mudae, kakera_ready=False или Power ниже цены кнопки."""
-    state = PROFILE_STATE if state is None else state
-    if kakera_on_cooldown():
+    if state is None:
+        state = _active_account().profile
+    account = Accounts.by_key(state.get('account_key')) or _active_account()
+    if kakera_on_cooldown(account):
         return True
     if state.get('kakera_ready') is False:
         return True
@@ -265,16 +296,16 @@ def reaction_energy_missing(state=None):
         return False
 
 
-def note_kakera_restored_by_dk():
+def note_kakera_restored_by_dk(account=None):
     """$dk полностью возвращает силу реакции. Старый Power клики больше не блокирует."""
-    global KAKERA_COOLDOWN_UNTIL
-    KAKERA_COOLDOWN_UNTIL = 0.0
-    PROFILE_STATE['kakera_ready'] = True
-    PROFILE_STATE['kakera_power'] = None
-    PROFILE_STATE['kakera_power_full'] = True
-    PROFILE_STATE['dk_ready'] = False
-    PROFILE_STATE['dk_minutes_left'] = 0
-    sync_profile_state(PROFILE_STATE)
+    account = account or _active_account()
+    _set_kakera_cooldown(0.0, account)
+    account.profile['kakera_ready'] = True
+    account.profile['kakera_power'] = None
+    account.profile['kakera_power_full'] = True
+    account.profile['dk_ready'] = False
+    account.profile['dk_minutes_left'] = 0
+    sync_profile_state(account.profile)
 
 
 # Ожидающий клейм (карточка до подтверждения «married»)
@@ -312,14 +343,15 @@ def _parse_marriage_parties(parsed):
 
 def try_use_dk_for_kakera_cd():
     """$dk только если команда готова и силы на реакцию нет."""
-    if not PROFILE_STATE.get('dk_ready'):
+    account = _active_account()
+    if not account.profile.get('dk_ready'):
         return False
-    if not reaction_energy_missing():
+    if not reaction_energy_missing(account.profile):
         return False
-    if _send_text_command('$dk') not in (200, 204):
+    if _send_text_command('$dk', account) not in (200, 204):
         return False
-    note_kakera_restored_by_dk()
-    log_msg('KAKER', '$dk отправлен. Сила реакции восстановлена.')
+    note_kakera_restored_by_dk(account)
+    log_msg('KAKER', f"$dk отправлен ({account.label}). Сила реакции восстановлена.")
     return True
 
 
@@ -330,43 +362,20 @@ def _resolve_username():
 
 
 def _our_user_id():
-    """Discord id нашего аккаунта (кэш GET /users/@me)."""
-    _our_discord_names()
-    return _CACHED_USER_ID or ''
+    """Discord id основного аккаунта."""
+    return Accounts.MAIN.user_id or _CACHED_USER_ID or ''
 
 
 def _our_discord_names():
-    """Возможные имена аккаунта (display / username / Vars.username)."""
+    """Имена всех аккаунтов роя (display / username / Vars.username)."""
     global _CACHED_USERNAME, _CACHED_USERNAMES, _CACHED_USER_ID
+    if Accounts.MAIN.user_id:
+        _CACHED_USER_ID = Accounts.MAIN.user_id
     names = []
-    configured = (getattr(Vars, 'username', None) or '').strip()
-    if configured:
-        names.append(configured)
-
-    if _CACHED_USERNAMES is None:
-        fetched = []
-        try:
-            response = requests.get(
-                'https://discord.com/api/v9/users/@me', headers=auth, timeout=8
-            )
-            if response.status_code == 200:
-                data = response.json()
-                _CACHED_USER_ID = str(data.get('id') or '')
-                display = (data.get('global_name') or '').strip()
-                login = (data.get('username') or '').strip()
-                if display:
-                    fetched.append(display)
-                if login:
-                    fetched.append(login)
-                _CACHED_USERNAME = display or login or ''
-        except requests.RequestException:
-            pass
-        _CACHED_USERNAMES = fetched
-
-    names.extend(_CACHED_USERNAMES or [])
-    if _CACHED_USERNAME:
-        names.append(_CACHED_USERNAME)
-
+    for account in Accounts.all_accounts():
+        names.extend(account.names())
+    if not names and _CACHED_USERNAMES:
+        names.extend(_CACHED_USERNAMES)
     seen = set()
     result = []
     for name in names:
@@ -374,6 +383,9 @@ def _our_discord_names():
         if key and key not in seen:
             seen.add(key)
             result.append(name)
+    if result:
+        _CACHED_USERNAME = result[0]
+        _CACHED_USERNAMES = list(result)
     return result
 
 
@@ -419,12 +431,23 @@ def _normalize_mudae_text(content):
     return text.strip()
 
 
+def _account_for_chat_name(name):
+    """Аккаунт роя по нику из ответа Mudae. None — это чужой ник."""
+    if name:
+        found = Accounts.by_name(name)
+        if found:
+            return found
+        if not _is_our_name(name):
+            return None
+    return _active_account()
+
+
 def handle_mudae_chat(content, message_id=None):
     """Реактивный парсер ответов Mudae: КД какеры, начисления, свадьбы.
 
     Возвращает dict с распознанным событием или None.
     """
-    global KAKERA_COOLDOWN_UNTIL, _PENDING_CLAIM
+    global _PENDING_CLAIM
 
     if not content:
         return None
@@ -441,7 +464,8 @@ def handle_mudae_chat(content, message_id=None):
     cd_match = _KAKERA_CD_RE.search(parsed)
     if cd_match:
         cd_name = (cd_match.group('name') or '').strip()
-        if cd_name and not _is_our_name(cd_name):
+        target = _account_for_chat_name(cd_name)
+        if target is None:
             return None
         if not _once('kakera_cd'):
             return None
@@ -454,13 +478,14 @@ def handle_mudae_chat(content, message_id=None):
                 minutes = 60
             else:
                 return None
-        KAKERA_COOLDOWN_UNTIL = time.time() + minutes * 60
+        _set_kakera_cooldown(time.time() + minutes * 60, target)
         log_msg(
             'KAKER',
-            f"Какера в откате на {minutes} мин "
-            f"(до {time.strftime('%H:%M:%S', time.localtime(KAKERA_COOLDOWN_UNTIL))}).",
+            f"Какера в откате на {minutes} мин ({target.label}) "
+            f"(до {time.strftime('%H:%M:%S', time.localtime(target.kakera_cooldown_until))}).",
         )
-        try_use_dk_for_kakera_cd()
+        with _use_account(target):
+            try_use_dk_for_kakera_cd()
         return {'type': 'kakera_cooldown', 'minutes': minutes}
 
     if _ROLLS_INTERVAL_BLOCK_RE.search(parsed):
@@ -470,6 +495,7 @@ def handle_mudae_chat(content, message_id=None):
 
     # Явный маркер ($ku) без стандартной фразы — всё равно ставим КД
     if '$ku' in lower and 'kakera' in lower:
+        target = _active_account()
         if not _once('kakera_cd'):
             return None
         minutes = 60
@@ -479,13 +505,14 @@ def handle_mudae_chat(content, message_id=None):
         if time_bits:
             minutes = int(time_bits.group(1) or 0) * 60 + int(time_bits.group(2) or 0)
         if minutes > 0:
-            KAKERA_COOLDOWN_UNTIL = time.time() + minutes * 60
+            _set_kakera_cooldown(time.time() + minutes * 60, target)
             log_msg(
                 'KAKER',
-                f"Какера в откате на {minutes} мин ($ku) "
-                f"(до {time.strftime('%H:%M:%S', time.localtime(KAKERA_COOLDOWN_UNTIL))}).",
+                f"Какера в откате на {minutes} мин ($ku, {target.label}) "
+                f"(до {time.strftime('%H:%M:%S', time.localtime(target.kakera_cooldown_until))}).",
             )
-            try_use_dk_for_kakera_cd()
+            with _use_account(target):
+                try_use_dk_for_kakera_cd()
             return {'type': 'kakera_cooldown', 'minutes': minutes}
 
     # --- C: успешный клейм (свадьба) — только НАША ---
@@ -508,16 +535,13 @@ def handle_mudae_chat(content, message_id=None):
         global _LAST_OUR_MARRIAGE
         _LAST_OUR_MARRIAGE = {'at': time.time(), 'name': character}
 
-        profile = _session_profile()
-        if isinstance(profile, dict):
-            profile['can_claim'] = False
-        PROFILE_STATE['can_claim'] = False
-        sync_profile_state(PROFILE_STATE)
-        with _ROLL_LOCK:
-            if _ROLL_SESSION.get('active'):
-                _ROLL_SESSION['claim_spent'] = True
-                _ROLL_SESSION['claim_buffer'] = []
-        WebDashboard.emit_buffer_clear()
+        claimer_account = Accounts.by_name(claimer) or _active_account()
+        claimer_account.profile['can_claim'] = False
+        sync_profile_state(claimer_account.profile)
+        if _ROLL_SESSION.get('active'):
+            _finish_claim_success(claimer_account, None)
+        else:
+            WebDashboard.emit_buffer_clear()
 
         amounts = [_parse_amount(x) for x in re.findall(r'\+(\d{1,3}(?:,\d{3})+|\d+)', parsed)]
         kakera_amount = amounts[0] if amounts else 0
@@ -929,15 +953,23 @@ def _wait_for_mudae_reply(after_message_id, attempts=6):
 
     return None
 
-def _send_text_command(command):
-    """Отправляет обычную текстовую команду Mudae и возвращает код ответа."""
+def post_text_message(command, account=None):
+    """Пишет текст в канал от аккаунта и возвращает ответ Discord (или None)."""
+    account = account or _active_account()
     action_pause()
     try:
-        response = requests.post(
-            url=url, headers=auth, json={'content': command}, timeout=10
+        return requests.post(
+            url=url, headers=account.auth, json={'content': command}, timeout=10
         )
     except requests.RequestException as error:
         log_msg('WARN', f"Не удалось отправить {command}: {error}")
+        return None
+
+
+def _send_text_command(command, account=None):
+    """Отправляет обычную текстовую команду Mudae и возвращает код ответа."""
+    response = post_text_message(command, account)
+    if response is None:
         return 0
     if response.status_code not in [200, 204]:
         log_msg('WARN',
@@ -1019,37 +1051,42 @@ def get_claim_ttl():
 
 
 def sync_profile_state(state):
-    """Обновляет локальный кэш PROFILE_STATE и пушит в Web UI."""
-    global PROFILE_STATE
+    """Пишет состояние в профиль того аккаунта, чей это $tu, и обновляет панель."""
     if not state:
         return PROFILE_STATE
-    for key in (
+    account = Accounts.by_key(state.get('account_key')) or _active_account()
+    keys = (
         'can_claim', 'rt_ready', 'claim_minutes_left', 'rolls_left', 'rolls_resets',
         'rolls_reset_minutes', 'kakera_power', 'kakera_cost', 'kakera_cost_keys',
         'kakera_power_full', 'kakera_ready',
         'current_threshold', 'rt_minutes_left', 'daily_ready', 'daily_minutes_left',
         'dk_ready', 'dk_minutes_left', 'claim_ttl',
-    ):
+    )
+    target = account.profile
+    for key in keys:
         if key in state:
-            PROFILE_STATE[key] = state[key]
+            target[key] = state[key]
+    target['account_key'] = account.key
     if 'current_threshold' not in state:
-        PROFILE_STATE['current_threshold'] = compute_claim_threshold(
-            PROFILE_STATE.get('claim_minutes_left', 0)
+        target['current_threshold'] = compute_claim_threshold(
+            target.get('claim_minutes_left', 0)
         )
-    WebDashboard.emit_profile_update(dict(PROFILE_STATE))
-    return PROFILE_STATE
+    WebDashboard.emit_profile_update(dict(Accounts.MAIN.profile))
+    WebDashboard.emit_swarm_accounts()
+    return target
 
 
-def _rolls_worth_spinning(profile_state):
+def _rolls_worth_spinning(profile_state, account=None):
     """Есть смысл тратить $rolls: клейм доступен или реакция какеры не в КД."""
     if profile_state.get('can_claim'):
         return True
-    # Живой таймер: в сессии КД мог измениться после кликов по какере
-    return not kakera_on_cooldown()
+    account = account or Accounts.by_key(profile_state.get('account_key')) or _active_account()
+    return not kakera_on_cooldown(account)
 
 
 def _try_use_rolls(profile_state, *, context=''):
     """Отправляет $rolls один раз за интервал, если есть сбросы и смысл крутить."""
+    account = Accounts.by_key((profile_state or {}).get('account_key')) or _active_account()
     if not getattr(Vars, 'rollsEnabled', True):
         suffix = f" ({context})" if context else ''
         log_msg('ROLL', f"$rolls выключен в Vars.rollsEnabled{suffix}.", dim=True)
@@ -1059,8 +1096,8 @@ def _try_use_rolls(profile_state, *, context=''):
     if rolls_resets <= 0:
         return False
 
-    if rolls_reset_on_cooldown():
-        left_min = max(1, (rolls_reset_cooldown_left_seconds() + 59) // 60)
+    if rolls_reset_on_cooldown(account):
+        left_min = max(1, (rolls_reset_cooldown_left_seconds(account) + 59) // 60)
         suffix = f" ({context})" if context else ''
         log_msg(
             'ROLL',
@@ -1070,37 +1107,38 @@ def _try_use_rolls(profile_state, *, context=''):
         )
         return False
 
-    if not _rolls_worth_spinning(profile_state):
+    if not _rolls_worth_spinning(profile_state, account):
         suffix = f" ({context})" if context else ''
         log_msg(
             'ROLL',
             f"$rolls пропущен{suffix}: "
             f"клейм={'да' if profile_state.get('can_claim') else 'нет'}, "
-            f"какера={'готова' if not kakera_on_cooldown() else 'в КД'} "
-            f"(таймер КД {kakera_cooldown_left_seconds()} сек).",
+            f"какера={'готова' if not kakera_on_cooldown(account) else 'в КД'} "
+            f"(таймер КД {kakera_cooldown_left_seconds(account)} сек).",
             dim=True,
         )
         return False
 
     suffix = f" — {context}" if context else ''
-    log_msg('ROLL', f"Использую $rolls{suffix}.")
+    log_msg('ROLL', f"Использую $rolls{suffix} ({account.label}).")
     last_message_id = _get_latest_message_id()
-    if _send_text_command('$rolls') not in [200, 204]:
+    if _send_text_command('$rolls', account) not in [200, 204]:
         return False
 
     mudae_message = _wait_for_mudae_reply(last_message_id)
     if mudae_message:
-        handle_mudae_chat(
-            mudae_message.get('content', ''),
-            message_id=mudae_message.get('id'),
-        )
-        if rolls_reset_on_cooldown():
+        with _use_account(account):
+            handle_mudae_chat(
+                mudae_message.get('content', ''),
+                message_id=mudae_message.get('id'),
+            )
+        if rolls_reset_on_cooldown(account):
             return False
 
     reset_in = int(profile_state.get('rolls_reset_minutes', 0) or 0)
     if reset_in <= 0:
         reset_in = _DEFAULT_ROLLS_INTERVAL_MINUTES
-    _set_rolls_reset_cooldown(reset_in, reason='успешный сброс')
+    _set_rolls_reset_cooldown(reset_in, reason='успешный сброс', account=account)
 
     profile_state['rolls_reset_used'] = True
     profile_state['rolls_resets'] = rolls_resets - 1
@@ -1112,11 +1150,12 @@ def _try_use_rolls(profile_state, *, context=''):
     return True
 
 
-def updateProfileState(_refreshed_after_dk=False, skip_actions=False):
+def updateProfileState(_refreshed_after_dk=False, skip_actions=False, account=None):
     """Запрашивает $tu, обновляет состояние профиля и запускает доступные действия."""
+    account = account or _active_account()
     last_message_id = _get_latest_message_id()
-    log_msg('SYS', "Запрашиваю состояние профиля ($tu)...", dim=True)
-    if _send_text_command('$tu') not in [200, 204]:
+    log_msg('SYS', f"Запрашиваю состояние профиля ($tu, {account.label})...", dim=True)
+    if _send_text_command('$tu', account) not in [200, 204]:
         return None
 
     mudae_message = _wait_for_mudae_reply(last_message_id)
@@ -1169,7 +1208,7 @@ def updateProfileState(_refreshed_after_dk=False, skip_actions=False):
     dk_ready, dk_minutes = _parse_cmd_cooldown(parsed_text, 'dk')
 
     # КД реакции из $tu. Сразу после $dk старая фраза «can't react» таймер не возвращает.
-    global KAKERA_COOLDOWN_UNTIL
+    prior = account.profile
     kakera_power = extract_int(r"Power:\s*(\d+)%")
     kakera_cost = extract_int(r"consumes\s+(\d+)%\s+of your reaction power")
     half_match = re.search(
@@ -1188,9 +1227,9 @@ def updateProfileState(_refreshed_after_dk=False, skip_actions=False):
     )
     power_full = False
     if _refreshed_after_dk:
-        full_cost = kakera_cost or int(PROFILE_STATE.get('kakera_cost') or 0)
+        full_cost = kakera_cost or int(prior.get('kakera_cost') or 0)
         restored = kakera_ready_tu or (full_cost > 0 and kakera_power >= full_cost)
-        KAKERA_COOLDOWN_UNTIL = 0.0
+        _set_kakera_cooldown(0.0, account)
         kakera_ready = True
         if restored:
             power_full = False
@@ -1198,25 +1237,26 @@ def updateProfileState(_refreshed_after_dk=False, skip_actions=False):
             kakera_power = None
             power_full = True
             if not kakera_cost:
-                kakera_cost = int(PROFILE_STATE.get('kakera_cost') or 0)
+                kakera_cost = int(prior.get('kakera_cost') or 0)
             if not kakera_cost_keys:
-                kakera_cost_keys = int(PROFILE_STATE.get('kakera_cost_keys') or 0)
+                kakera_cost_keys = int(prior.get('kakera_cost_keys') or 0)
     elif kakera_ready_tu:
-        KAKERA_COOLDOWN_UNTIL = 0.0
+        _set_kakera_cooldown(0.0, account)
         kakera_ready = True
     elif kakera_cd:
         minutes = int(kakera_cd.group(1) or 0) * 60 + int(kakera_cd.group(2) or 0)
         if minutes > 0:
-            KAKERA_COOLDOWN_UNTIL = time.time() + minutes * 60
+            _set_kakera_cooldown(time.time() + minutes * 60, account)
         kakera_ready = False
     elif "can't react to kakera" in lower_text:
         kakera_ready = False
     else:
-        kakera_ready = not kakera_on_cooldown()
+        kakera_ready = not kakera_on_cooldown(account)
         if kakera_ready:
-            KAKERA_COOLDOWN_UNTIL = 0.0
+            _set_kakera_cooldown(0.0, account)
 
     state = {
+        'account_key': account.key,
         'can_claim': "you can't claim" not in lower_text,
         'claim_minutes_left': claim_minutes_left,
         'rolls_reset_minutes': rolls_reset_minutes,
@@ -1244,7 +1284,7 @@ def updateProfileState(_refreshed_after_dk=False, skip_actions=False):
 
     if state['daily_ready'] is True:
         log_msg('SYS', "$daily доступен. Отправляю команду.", dim=True)
-        if _send_text_command('$daily') in [200, 204]:
+        if _send_text_command('$daily', account) in [200, 204]:
             log_msg('SYS', '🎁 Ежедневная награда ($daily) успешно забрана!')
 
     # $dk полностью восстанавливает силу. Жать только когда он готов и реакции нет.
@@ -1253,10 +1293,10 @@ def updateProfileState(_refreshed_after_dk=False, skip_actions=False):
         and reaction_energy_missing(state)
         and not _refreshed_after_dk
     ):
-        if _send_text_command('$dk') in (200, 204):
-            note_kakera_restored_by_dk()
-            log_msg('KAKER', '$dk отправлен. Сила реакции восстановлена.')
-            return updateProfileState(_refreshed_after_dk=True)
+        if _send_text_command('$dk', account) in (200, 204):
+            note_kakera_restored_by_dk(account)
+            log_msg('KAKER', f"$dk отправлен ({account.label}). Сила реакции восстановлена.")
+            return updateProfileState(_refreshed_after_dk=True, account=account)
 
     # $rolls: есть смысл крутить, если доступен клейм ИЛИ реакция какеры ($tu)
     if state['rolls_left'] == 0 and state['rolls_resets'] > 0:
@@ -1301,7 +1341,7 @@ def _ensure_claim_ready(profile_state, allow_rt=False, channel_id=None, message_
 
     log_msg('CLAIM', "Клейм уже потрачен. $rt доступен — отправляю и жду сброс перед кнопкой.", dim=True)
     after_id = _get_latest_message_id()
-    if _send_text_command('$rt') not in [200, 204]:
+    if _send_text_command('$rt', Accounts.by_key(profile_state.get('account_key')) or _active_account()) not in [200, 204]:
         return False
 
     # Команда ушла в Discord. Второй $rt в этой попытке не шлём.
@@ -1641,25 +1681,28 @@ def _card_key_count(message):
     return 0
 
 
-def _kakera_button_cost(message):
-    full = int(PROFILE_STATE.get('kakera_cost') or 0)
-    half = int(PROFILE_STATE.get('kakera_cost_keys') or 0)
+def _kakera_button_cost(message, account=None):
+    profile = (account or _active_account()).profile
+    full = int(profile.get('kakera_cost') or 0)
+    half = int(profile.get('kakera_cost_keys') or 0)
     if half and message is not None and _card_key_count(message) >= 10:
         return half
     return full
 
 
-def _kakera_clicks_open(message=None):
+def _kakera_clicks_open(message=None, account=None):
     """Можно жать какеру: нет кулдауна и хватает Power. Сферы от этого не зависят."""
-    if kakera_on_cooldown():
+    account = account or _active_account()
+    profile = account.profile
+    if kakera_on_cooldown(account):
         return False
-    if PROFILE_STATE.get('kakera_power_full'):
+    if profile.get('kakera_power_full'):
         return True
-    power = PROFILE_STATE.get('kakera_power')
+    power = profile.get('kakera_power')
     if power is None:
         return True
-    cost = _kakera_button_cost(message) if message is not None else int(
-        PROFILE_STATE.get('kakera_cost') or 0
+    cost = _kakera_button_cost(message, account) if message is not None else int(
+        profile.get('kakera_cost') or 0
     )
     if cost <= 0:
         return True
@@ -1669,19 +1712,22 @@ def _kakera_clicks_open(message=None):
         return True
 
 
-def _spend_kakera_power(message):
-    if PROFILE_STATE.get('kakera_power_full'):
+def _spend_kakera_power(message, account=None):
+    account = account or _active_account()
+    profile = account.profile
+    if profile.get('kakera_power_full'):
         return
-    power = PROFILE_STATE.get('kakera_power')
+    power = profile.get('kakera_power')
     if power is None:
         return
-    cost = _kakera_button_cost(message)
+    cost = _kakera_button_cost(message, account)
     if cost <= 0:
         return
     left = max(0, int(power) - cost)
-    PROFILE_STATE['kakera_power'] = left
+    profile['kakera_power'] = left
     if left < cost:
-        PROFILE_STATE['kakera_ready'] = False
+        profile['kakera_ready'] = False
+    sync_profile_state(profile)
 
 
 def _raw_loot_buttons(message):
@@ -1723,11 +1769,12 @@ def _join_name_counts(names):
 
 
 def _loot_shortfall_reason(message):
-    if kakera_on_cooldown():
-        return f"КД {kakera_cooldown_left_seconds()} сек"
-    if not _kakera_clicks_open(message):
-        power = PROFILE_STATE.get('kakera_power')
-        cost = _kakera_button_cost(message)
+    account = _active_account()
+    if kakera_on_cooldown(account):
+        return f"КД {kakera_cooldown_left_seconds(account)} сек"
+    if not _kakera_clicks_open(message, account):
+        power = account.profile.get('kakera_power')
+        cost = _kakera_button_cost(message, account)
         if power is None:
             return 'силы нет'
         return f"сила {int(power)}% < {int(cost)}%"
@@ -1760,7 +1807,7 @@ def _log_loot_summary(message, clicked_kakera, clicked_spheres, seen, log_prefix
     log_msg('KAKER', text, dim=seen <= total)
 
 
-def _kakera_targets(message):
+def _kakera_targets(message, *, include_spheres=True):
     """Кнопки какеры и ourosphere. Сферы жмутся и без силы на реакцию."""
     kakera_names = _kakera_click_names()
     take_kakera = _kakera_clicks_open(message)
@@ -1768,7 +1815,7 @@ def _kakera_targets(message):
     for button in _iter_message_buttons(message.get('components')):
         emoji = _button_emoji_name(button)
         key = emoji.casefold()
-        if key in _OUROSPHERE_VALUES_CF:
+        if include_spheres and key in _OUROSPHERE_VALUES_CF:
             targets.append((emoji, button))
         elif take_kakera and key in kakera_names:
             targets.append((emoji, button))
@@ -1842,6 +1889,7 @@ def click_desired_kakera(
     log_prefix='Найдена кнопка какеры',
     clicked_ids=None,
     wait_for_buttons=True,
+    include_spheres=True,
 ):
     """Жмёт какеры и ourosphere по одной, каждый раз с актуальным custom_id."""
     if not message or not message.get('id'):
@@ -1875,7 +1923,7 @@ def click_desired_kakera(
     while clicks < limit:
         seen = max(seen, len(_desired_kakera_buttons(message)))
         targets = [
-            item for item in _kakera_targets(message)
+            item for item in _kakera_targets(message, include_spheres=include_spheres)
             if item[1].get('custom_id') not in clicked_ids
         ]
         if not targets:
@@ -1913,7 +1961,7 @@ def click_desired_kakera(
         try:
             human_sleep(0.08, 0.18, kind='kakera', log=False)
             author_id = (message.get('author') or {}).get('id') or botID
-            response = bot.click(
+            response = _active_account().client.click(
                 author_id,
                 channelID=channel_id,
                 guildID=guild_id,
@@ -1929,7 +1977,7 @@ def click_desired_kakera(
                 energy_tried = False
                 if is_kakera:
                     clicked_kakera.append(emoji)
-                    _spend_kakera_power(message)
+                    _spend_kakera_power(message, _active_account())
                 else:
                     clicked_spheres.append(emoji)
         except Exception as error:
@@ -2003,14 +2051,15 @@ def _claim_via_button(message, button):
     guild_id = message.get('guild_id') or Vars.serverId
     author_id = (message.get('author') or {}).get('id') or botID
     emoji_name = (button.get('emoji') or {}).get('name') or button.get('label') or '?'
+    claimer = _active_account()
     log_msg(
         'CLAIM',
-        f"Клейм через кнопку ({emoji_name}, custom_id={button.get('custom_id')[:24]}...).",
+        f"Клейм через кнопку ({claimer.label}, {emoji_name}, custom_id={button.get('custom_id')[:24]}...).",
         dim=True,
     )
     action_pause()
     try:
-        response = bot.click(
+        response = claimer.client.click(
             author_id,
             channelID=str(channel_id),
             guildID=str(guild_id),
@@ -2042,7 +2091,7 @@ def _claim_via_reaction(message_id, channel_id=None):
         claim_req = requests.put(
             f'https://discord.com/api/v9/channels/{channel_id}/messages/'
             f'{message_id}/reactions/{_CLAIM_REACTION_EMOJI}/%40me',
-            headers=auth,
+            headers=_active_account().auth,
             timeout=10,
         )
     except requests.RequestException as error:
@@ -2190,7 +2239,7 @@ def _send_pokeslot():
     log_msg('ROLL', "Пытаюсь крутить Pokeslot ($p)...", dim=True)
     try:
         poke_req = requests.post(
-            url=url, headers=auth, json={'content': '$p'}, timeout=15
+            url=url, headers=_active_account().auth, json={'content': '$p'}, timeout=15
         )
     except requests.RequestException as error:
         log_msg('WARN', f"Pokeslot: соединение сброшено ({error})")
@@ -2215,6 +2264,10 @@ _ROLL_SESSION = {
     'jackpot_threshold': 0.0,
     'last_send_at': 0.0,
     'last_event_at': 0.0,
+    'bonus_us': False,
+    'claims_used': set(),
+    'roller_key': 'main',
+    'stop_before': None,
 }
 _OWNER_BY_MESSAGE = {}
 _MESSAGE_CACHE = {}
@@ -2346,9 +2399,11 @@ def _wish_mention_owner(message):
     if not wish:
         return None
     tail = wish.group(1).splitlines()[0]
-    our = _our_user_id()
-    if our and (f'<@{our}>' in tail or f'<@!{our}>' in tail):
-        return 'ours'
+    for account in Accounts.all_accounts():
+        if account.user_id and (
+            f'<@{account.user_id}>' in tail or f'<@!{account.user_id}>' in tail
+        ):
+            return 'ours'
     if re.search(r'<@!?\d+>', tail):
         return 'other'
     who = re.sub(r'<@!?\d+>', '', tail)
@@ -2370,19 +2425,48 @@ def _priority_claim_reason(our_wish, name, power, jackpot_threshold):
     return f"джекпот цена {power} >= {jackpot_threshold:g}"
 
 
+_ROLLER_BY_MESSAGE = {}
+
+
+def _remember_roller(message, account):
+    mid = str((message or {}).get('id') or '')
+    if not mid or account is None:
+        return
+    _ROLLER_BY_MESSAGE[mid] = account.key
+    if len(_ROLLER_BY_MESSAGE) > 500:
+        _ROLLER_BY_MESSAGE.clear()
+        _ROLLER_BY_MESSAGE[mid] = account.key
+
+
+def roller_account(message):
+    """Кто из роя отправил этот ролл. Иначе крутящий текущей сессии."""
+    mid = str((message or {}).get('id') or '')
+    found = Accounts.by_key(_ROLLER_BY_MESSAGE.get(mid))
+    if found:
+        return found
+    with _ROLL_LOCK:
+        key = _ROLL_SESSION.get('roller_key')
+    return Accounts.by_key(key)
+
+
 def _classify_roll_owner_fresh(message):
     """'ours' / 'other' / 'unknown' по этому payload, без кэша."""
-    our = _our_user_id()
     uid = _interaction_user_id(message)
-    if uid and our:
-        return 'ours' if uid == our else 'other'
+    if uid:
+        account = Accounts.by_user_id(uid)
+        if account:
+            _remember_roller(message, account)
+            return 'ours'
+        return 'other'
 
     ref = message.get('referenced_message') or {}
     if isinstance(ref, dict):
         ref_author = str((ref.get('author') or {}).get('id') or '')
-        if ref_author and our and ref_author == our:
-            return 'ours'
-        if ref_author and our:
+        if ref_author:
+            account = Accounts.by_user_id(ref_author)
+            if account:
+                _remember_roller(message, account)
+                return 'ours'
             return 'other'
 
     blob = _message_text_blob(message)
@@ -2420,7 +2504,15 @@ def _log_unknown_owner(message):
     )
 
 
-def begin_roll_session(profile_state, current_threshold, jackpot_threshold):
+def begin_roll_session(
+    profile_state,
+    current_threshold,
+    jackpot_threshold,
+    *,
+    bonus_us=False,
+    roller_key='main',
+    stop_before=None,
+):
     with _ROLL_LOCK:
         _ROLL_SESSION['active'] = True
         _ROLL_SESSION['limit_reached'] = False
@@ -2428,6 +2520,10 @@ def begin_roll_session(profile_state, current_threshold, jackpot_threshold):
         _ROLL_SESSION['claiming'] = False
         _ROLL_SESSION['claimed_msg_id'] = ''
         _ROLL_SESSION['claim_buffer'] = []
+        _ROLL_SESSION['claims_used'] = set()
+        _ROLL_SESSION['bonus_us'] = bool(bonus_us)
+        _ROLL_SESSION['roller_key'] = roller_key or 'main'
+        _ROLL_SESSION['stop_before'] = stop_before
         _ROLL_SESSION['profile_state'] = profile_state
         _ROLL_SESSION['current_threshold'] = float(current_threshold)
         _ROLL_SESSION['jackpot_threshold'] = float(jackpot_threshold)
@@ -2435,6 +2531,41 @@ def begin_roll_session(profile_state, current_threshold, jackpot_threshold):
         _ROLL_SESSION['last_send_at'] = now
         _ROLL_SESSION['last_event_at'] = now
     WebDashboard.emit_buffer_clear()
+
+
+def _someone_can_still_claim():
+    """Вызывать под _ROLL_LOCK. Свободный клейм ещё есть у кого-то из роя."""
+    used = _ROLL_SESSION.get('claims_used') or set()
+    return any(
+        account.key not in used and account.profile.get('can_claim')
+        for account in Accounts.all_accounts()
+    )
+
+
+def _finish_claim_success(account, message_id):
+    """Клейм списан только у этого аккаунта. Буфер остаётся, если кто-то ещё может взять карту."""
+    cleared = False
+    with _ROLL_LOCK:
+        used = _ROLL_SESSION.setdefault('claims_used', set())
+        if account is not None:
+            used.add(account.key)
+        if message_id:
+            mid = str(message_id)
+            _ROLL_SESSION['claimed_msg_id'] = mid
+            if len(_CLAIMED_OK) > 400:
+                _CLAIMED_OK.clear()
+            _CLAIMED_OK.add(mid)
+        if _ROLL_SESSION.get('active') and not _someone_can_still_claim():
+            _ROLL_SESSION['claim_spent'] = True
+            _ROLL_SESSION['claim_buffer'] = []
+            cleared = True
+        elif _ROLL_SESSION.get('active'):
+            _ROLL_SESSION['claim_spent'] = False
+    if cleared:
+        WebDashboard.emit_buffer_clear()
+    elif message_id:
+        _drop_buffered_card(message_id)
+    return True
 
 
 def end_roll_session():
@@ -2519,7 +2650,8 @@ def _claim_from_session(message, reason, *, allow_rt, name, series, power, clear
                     if _ROLL_SESSION['claim_spent'] and not allow_rt:
                         return False
                     _ROLL_SESSION['claiming'] = True
-                    profile = _session_profile()
+                    roller_key = _ROLL_SESSION.get('roller_key')
+                    used = set(_ROLL_SESSION.get('claims_used') or ())
                     if clear_buffer:
                         _ROLL_SESSION['claim_buffer'] = []
                     break
@@ -2535,12 +2667,17 @@ def _claim_from_session(message, reason, *, allow_rt, name, series, power, clear
         time.sleep(0.05)
     if clear_buffer:
         WebDashboard.emit_buffer_clear()
+    import Swarm
+    account = Swarm.pick_claimer(roller_key, allow_rt=allow_rt, claims_used=used)
     success = False
     try:
+        if account is None:
+            log_msg('CLAIM', 'Клеймить некому: в рое нет свободного клейма.', dim=True)
+            return False
         success = _claim_card(
             message.get('id'),
-            reason,
-            profile,
+            f'{account.label}: {reason}',
+            account.profile,
             message=message,
             components=message.get('components'),
             card_name=name or '',
@@ -2550,17 +2687,9 @@ def _claim_from_session(message, reason, *, allow_rt, name, series, power, clear
         )
     finally:
         with _ROLL_LOCK:
-            if success:
-                _ROLL_SESSION['claim_spent'] = True
-                if message_id:
-                    _ROLL_SESSION['claimed_msg_id'] = message_id
-                    if len(_CLAIMED_OK) > 400:
-                        _CLAIMED_OK.clear()
-                    _CLAIMED_OK.add(message_id)
-                _ROLL_SESSION['claim_buffer'] = []
             _ROLL_SESSION['claiming'] = False
-    if success:
-        WebDashboard.emit_buffer_clear()
+        if success:
+            _finish_claim_success(account, message_id)
     return success
 
 
@@ -2588,42 +2717,57 @@ def process_roll_claim_buffer(force=False):
             trigger = "достигнут лимит роллов" if force else f"сработал таймер {claim_ttl} сек"
             size = len(_ROLL_SESSION['claim_buffer'])
             _ROLL_SESSION['claiming'] = True
-            profile = _session_profile()
-            _ROLL_SESSION['claim_buffer'] = []
+            roller_key = _ROLL_SESSION.get('roller_key')
+            used = set(_ROLL_SESSION.get('claims_used') or ())
+            best_id = str(best.get('msg_id') or '')
+            _ROLL_SESSION['claim_buffer'] = [
+                card for card in _ROLL_SESSION['claim_buffer']
+                if str(card.get('msg_id')) != best_id
+            ]
+            remaining = list(_ROLL_SESSION['claim_buffer'])
     if best is None:
         if should_clear:
             WebDashboard.emit_buffer_clear()
         return
 
     WebDashboard.emit_buffer_clear()
+    ttl = get_claim_ttl()
+    for card in remaining:
+        WebDashboard.emit_buffer_card({
+            'msg_id': card['msg_id'],
+            'power': card['power'],
+            'name': card['name'],
+            'series': card['series'],
+            'ttl_ms': ttl * 1000,
+            'claim_ttl': ttl,
+        })
     log_msg(
         'CLAIM',
         f"Буфер: {trigger}; старшей карте {elapsed:.1f} сек. "
         f"Выбрана лучшая карта (цена персонажа {best['power']}) из {size}.",
     )
+    import Swarm
+    account = Swarm.pick_claimer(roller_key, allow_rt=False, claims_used=used)
     success = False
     try:
-        success = _claim_card(
-            best['msg_id'],
-            f"снайпинг из буфера (цена {best['power']})",
-            profile,
-            message=best.get('message'),
-            components=best.get('components'),
-            card_name=best.get('name') or '',
-            card_series=best.get('series') or '',
-            card_power=best.get('power') or 0,
-        )
+        if account is None:
+            log_msg('CLAIM', 'Буфер: клеймить некому, карта остаётся в канале.', dim=True)
+        else:
+            success = _claim_card(
+                best['msg_id'],
+                f"{account.label}: снайпинг из буфера (цена {best['power']})",
+                account.profile,
+                message=best.get('message'),
+                components=best.get('components'),
+                card_name=best.get('name') or '',
+                card_series=best.get('series') or '',
+                card_power=best.get('power') or 0,
+            )
     finally:
         with _ROLL_LOCK:
-            if success:
-                _ROLL_SESSION['claim_spent'] = True
-                claimed_id = str(best.get('msg_id') or '')
-                if claimed_id:
-                    _ROLL_SESSION['claimed_msg_id'] = claimed_id
-                    if len(_CLAIMED_OK) > 400:
-                        _CLAIMED_OK.clear()
-                    _CLAIMED_OK.add(claimed_id)
             _ROLL_SESSION['claiming'] = False
+        if success:
+            _finish_claim_success(account, best.get('msg_id'))
 
 
 def _buffer_own_card(message, name, series, power, threshold):
@@ -2691,7 +2835,6 @@ def _consider_own_claim(message):
     our_wish = _wish_mention_owner(message) == 'ours'
 
     if not active:
-        profile = PROFILE_STATE
         threshold = PROFILE_STATE.get('current_threshold')
         if threshold is None:
             threshold = compute_claim_threshold(PROFILE_STATE.get('claim_minutes_left', 0))
@@ -2700,38 +2843,42 @@ def _consider_own_claim(message):
             float(Vars.min_power_threshold) * float(getattr(Vars, 'jackpot_multiplier', 3)),
             threshold * float(getattr(Vars, 'jackpot_threshold_factor', 1.5)),
         )
-        if our_wish or power >= jackpot_threshold:
-            _track_claim(mid, lambda: _claim_card(
+
+        def _outside(reason, allow_rt):
+            import Swarm
+            roller = roller_account(message)
+            account = Swarm.pick_claimer(
+                roller.key if roller else Accounts.MAIN.key,
+                allow_rt=allow_rt,
+                claims_used=set(),
+            )
+            if account is None:
+                log_msg('CLAIM', f'Пропуск {name}: в рое нет свободного клейма.', dim=True)
+                return False
+            return _claim_card(
                 message.get('id'),
-                _priority_claim_reason(our_wish, name, power, jackpot_threshold),
-                profile,
+                f'{account.label}: {reason}',
+                account.profile,
                 message=message,
                 card_name=name,
                 card_series=series,
                 card_power=power,
-                allow_rt=True,
+                allow_rt=allow_rt,
+            )
+
+        if our_wish or power >= jackpot_threshold:
+            _track_claim(mid, lambda: _outside(
+                _priority_claim_reason(our_wish, name, power, jackpot_threshold),
+                True,
             ))
             return
         if series in Vars.desiredSeries:
-            _track_claim(mid, lambda: _claim_card(
-                message.get('id'),
-                f"совпадение по серии: '{series}'",
-                profile,
-                message=message,
-                card_name=name,
-                card_series=series,
-                card_power=power,
-            ))
+            _track_claim(mid, lambda: _outside(f"совпадение по серии: '{series}'", False))
             return
         if power >= threshold:
-            _track_claim(mid, lambda: _claim_card(
-                message.get('id'),
+            _track_claim(mid, lambda: _outside(
                 f"своя карта цена {power} >= {threshold:g}",
-                profile,
-                message=message,
-                card_name=name,
-                card_series=series,
-                card_power=power,
+                False,
             ))
             return
         if mid:
@@ -2774,8 +2921,29 @@ _LOOT_GUARD = threading.Lock()
 _LOOT_ACTIVE = set()
 
 
-def click_card_loot(message, *, log_prefix='Найдена кнопка какеры'):
-    """Какера из Vars.desiredKakeras и ourosphere. Повторный клик той же кнопки не шлём."""
+def _loot_accounts(message, only_account):
+    """Кто жмёт добычу. Снайп передаёт только основной. Сферу жмёт крутящий."""
+    import Swarm
+    if only_account is not None:
+        return [only_account], only_account.key
+    roller = roller_account(message) or Accounts.MAIN
+    ordered = []
+    seen = set()
+    for account in [roller] + list(Swarm.reaction_accounts()):
+        if account is None or account.key in seen:
+            continue
+        seen.add(account.key)
+        ordered.append(account)
+    if not ordered:
+        ordered = [roller]
+    return ordered, roller.key
+
+
+def click_card_loot(message, *, log_prefix='Найдена кнопка какеры', only_account=None):
+    """Какера из Vars.desiredKakeras и ourosphere. Повторный клик той же кнопки не шлём.
+
+    На своём ролле какеру жмёт каждый, у кого есть сила. Сферу — только крутящий.
+    """
     if not message or not message.get('id'):
         return 0
     _learn_emoji_shortcodes(_message_text_blob(message))
@@ -2787,20 +2955,26 @@ def click_card_loot(message, *, log_prefix='Найдена кнопка каке
         _LOOT_ACTIVE.add(mid)
         _LOOT_DIRTY.discard(mid)
     try:
+        accounts, sphere_key = _loot_accounts(message, only_account)
         total = 0
-        clicked_ids = _clicked_components(mid)
-        for _ in range(4):
-            total += click_desired_kakera(
-                message,
-                log_prefix=log_prefix,
-                clicked_ids=clicked_ids,
-                wait_for_buttons=True,
-            ) or 0
-            with _LOOT_GUARD:
-                if mid not in _LOOT_DIRTY:
-                    break
-                _LOOT_DIRTY.discard(mid)
-            message = _MESSAGE_CACHE.get(mid) or message
+        for index, account in enumerate(accounts):
+            if index:
+                human_sleep(0.4, 1.2, kind='action', log=False)
+            clicked_ids = _clicked_components(f'{mid}:{account.key}')
+            with _use_account(account):
+                for _ in range(4):
+                    total += click_desired_kakera(
+                        message,
+                        log_prefix=f'{log_prefix} · {account.label}',
+                        clicked_ids=clicked_ids,
+                        wait_for_buttons=True,
+                        include_spheres=(account.key == sphere_key),
+                    ) or 0
+                    with _LOOT_GUARD:
+                        if mid not in _LOOT_DIRTY:
+                            break
+                        _LOOT_DIRTY.discard(mid)
+                    message = _MESSAGE_CACHE.get(mid) or message
         return total
     finally:
         with _LOOT_GUARD:
@@ -2834,10 +3008,14 @@ def on_mudae_gateway_message(message, *, is_update=False):
     ):
         with _ROLL_LOCK:
             _ROLL_SESSION['limit_reached'] = True
+            bonus = bool(_ROLL_SESSION.get('bonus_us'))
             profile = _session_profile()
-            if profile is not None:
+            if profile is not None and not bonus:
                 profile['rolls_left'] = 0
-        log_msg('WARN', "Mudae сообщила о лимите прокрутов. Прокруты закончились!")
+        if _ROLL_SESSION.get('bonus_us'):
+            log_msg('ROLL', "Разовые роллы $us кончились. Часовые роллы не трогаю.")
+        else:
+            log_msg('WARN', "Mudae сообщила о лимите прокрутов. Прокруты закончились!")
         return 'ours'
 
     if owner == 'unknown':
@@ -2849,15 +3027,19 @@ def on_mudae_gateway_message(message, *, is_update=False):
             and (time.time() - LAST_OUR_ROLL_TIME) <= 6
         )
         if recent_own_roll and (message.get('components') or message.get('embeds')):
-            log_msg(
-                'KAKER',
-                "Владелец ролла не распознан, но команда только что наша — жму какеру.",
-                dim=True,
-            )
-            _learn_emoji_shortcodes(_message_text_blob(message))
-            click_card_loot(message)
-        return 'unknown'
+            with _ROLL_LOCK:
+                roller = Accounts.by_key(_ROLL_SESSION.get('roller_key')) or Accounts.MAIN
+            _remember_roller(message, roller)
+            owner = 'ours'
+        else:
+            return 'unknown'
     if owner != 'ours':
+        if (
+            owner == 'other'
+            and channel_id == str(Vars.channelId)
+            and _looks_like_card(message)
+        ):
+            note_foreign_roll()
         return owner
 
     with _ROLL_LOCK:
@@ -2893,29 +3075,208 @@ def _settle_roll_session():
         process_roll_claim_buffer(force=True)
 
 
-def simpleRoll():
-    global LAST_OUR_ROLL_TIME
-    set_rolling(True)
-    log_msg('ROLL', f"Начинаю сессию прокрутов: /{Vars.rollCommand}")
+def note_foreign_roll():
+    """Чужая карта в нашем канале: эфир занят, свою крутку не начинаем."""
+    global LAST_FOREIGN_ROLL_AT
+    LAST_FOREIGN_ROLL_AT = time.time()
 
+
+def _deadline_ts(deadline):
+    if deadline is None:
+        return None
+    if hasattr(deadline, 'timestamp'):
+        return float(deadline.timestamp())
+    return float(deadline)
+
+
+def wait_channel_quiet(deadline=None, max_wait=None):
+    """Ждёт, пока чужие роллы затихнут.
+
+    False — упёрлись в ресет и крутить нельзя.
+    True — тихо, либо ждать дальше нельзя и сессию всё же можно продолжить.
+    """
+    lo = float(getattr(Vars, 'channel_quiet_min', 25) or 0)
+    hi = float(getattr(Vars, 'channel_quiet_max', 50) or 0)
+    if hi < lo:
+        lo, hi = hi, lo
+    need = human_delay(lo, hi) if hi > 0 else 0
+    if need <= 0:
+        return True
+    deadline_ts = _deadline_ts(deadline)
+    started = time.monotonic()
+    announced = False
+    while True:
+        if deadline_ts is not None and time.time() >= deadline_ts:
+            log_msg('ROLL', 'До ресета роллов уже не успеть.')
+            return False
+        if not LAST_FOREIGN_ROLL_AT or time.time() - LAST_FOREIGN_ROLL_AT >= need:
+            if announced:
+                log_msg('ROLL', 'Эфир свободен, продолжаю.', dim=True)
+            return True
+        if max_wait is not None and time.monotonic() - started >= float(max_wait):
+            log_msg('ROLL', 'Эфир всё ещё занят. Дальше не жду и иду крутить.', dim=True)
+            return True
+        if not announced:
+            log_msg('ROLL', 'Канал занят чужой круткой, жду тишину.', dim=True)
+            announced = True
+        time.sleep(1)
+
+
+_US_READY = threading.Event()
+_US_MESSAGE_ID = ''
+
+_CHECK_NAMES = {
+    'white_check_mark',
+    '✅',
+    '\u2705',
+    '✔',
+    'heavy_check_mark',
+}
+
+
+def _message_has_checkmark(message_id, account):
+    """Галочка на нашем сообщении. REST, если событие реакции не дошло."""
     try:
-        _simpleRoll_body()
-    finally:
-        set_rolling(False)
+        response = requests.get(
+            f'https://discord.com/api/v9/channels/{Vars.channelId}/messages/{message_id}',
+            headers=account.auth,
+            timeout=8,
+        )
+    except requests.RequestException:
+        return False
+    if response.status_code != 200:
+        return False
+    for reaction in response.json().get('reactions') or []:
+        emoji = reaction.get('emoji') or {}
+        name = (emoji.get('name') or '').strip().strip(':')
+        if name in _CHECK_NAMES and int(reaction.get('count') or 0) > 0:
+            return True
+    return False
 
 
-def _simpleRoll_body():
+def arm_us_wait(message_id):
+    global _US_MESSAGE_ID
+    _US_READY.clear()
+    _US_MESSAGE_ID = str(message_id or '')
+
+
+def note_us_reaction(message_id, user_id, emoji_name):
+    """Галочка Mudae на нашем $us."""
+    if not _US_MESSAGE_ID or str(message_id or '') != _US_MESSAGE_ID:
+        return
+    if str(user_id or '') != str(botID):
+        return
+    name = (emoji_name or '').strip().strip(':')
+    if name in _CHECK_NAMES:
+        _US_READY.set()
+
+
+_US_BATCH = 20
+
+
+def _confirm_us_batch(account):
+    """Один $us 20. True, только если Mudae поставила галочку."""
+    response = post_text_message('$us 20', account)
+    if response is None or response.status_code not in (200, 204):
+        log_msg('WARN', 'Не удалось отправить $us 20.')
+        return False
+    message_id = ''
+    try:
+        message_id = str((response.json() or {}).get('id') or '')
+    except ValueError:
+        message_id = ''
+    if not message_id:
+        log_msg('WARN', '$us 20 ушло, но id сообщения не пришёл.')
+        return False
+    arm_us_wait(message_id)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not _US_READY.is_set():
+        if _message_has_checkmark(message_id, account):
+            _US_READY.set()
+            break
+        time.sleep(0.4)
+    if not _US_READY.is_set():
+        log_msg('WARN', 'Mudae не поставила галочку на $us 20.')
+        return False
+    return True
+
+
+def use_stacked_rolls(count=20, stop_before=None):
+    """Несколько $us 20, затем столько же слэшей. Часовой запас не тратит.
+
+    100 роллов — это пять команд `$us 20`. Без галочки пачка обрывается,
+    и крутятся только уже подтверждённые.
+    """
+    account = Accounts.MAIN
+    requested = max(_US_BATCH, int(count or _US_BATCH))
+    batches = (requested + _US_BATCH - 1) // _US_BATCH
+    unlocked = 0
+    with _use_account(account):
+        for index in range(batches):
+            if stop_before is not None and time.time() >= _deadline_ts(stop_before):
+                log_msg('WARN', 'Ресет близко, оставшиеся $us 20 не отправляю.')
+                break
+            log_msg('ROLL', f'Отправляю $us 20 ({index + 1}/{batches}).')
+            if not _confirm_us_batch(account):
+                break
+            unlocked += _US_BATCH
+            if index + 1 < batches:
+                human_sleep(0.8, 1.6, kind='action', log=False)
+        if unlocked <= 0:
+            log_msg('WARN', 'Ни один $us 20 не подтвердился. Роллы не начинаю.')
+            return False
+        log_msg('ROLL', f'Открыто {unlocked} разовых роллов. Кручу.')
+        simpleRoll(
+            account,
+            max_rolls=unlocked,
+            bonus_us=True,
+            record_duration=False,
+            stop_before=stop_before,
+        )
+        return True
+
+
+def simpleRoll(account=None, *, max_rolls=None, bonus_us=False, record_duration=True, stop_before=None):
+    account = Accounts.resolve(account)
+    elapsed = 0
+    with _use_account(account):
+        set_rolling(True)
+        log_msg('ROLL', f"Начинаю сессию прокрутов ({account.label}): /{Vars.rollCommand}")
+        try:
+            elapsed = _simpleRoll_body(
+                account,
+                max_rolls=max_rolls,
+                bonus_us=bonus_us,
+                stop_before=stop_before,
+            ) or 0
+        finally:
+            set_rolling(False)
+    if record_duration and elapsed > 0 and not bonus_us:
+        import Database
+        Database.save_roll_duration(account.key, elapsed)
+        account.last_session_seconds = float(elapsed)
+        WebDashboard.emit_swarm_accounts()
+    return elapsed
+
+
+def _simpleRoll_body(account=None, *, max_rolls=None, bonus_us=False, stop_before=None):
     global LAST_OUR_ROLL_TIME
+    account = Accounts.resolve(account)
     if not GATEWAY_LISTENING.wait(timeout=12):
         log_msg(
             'WARN',
             "Gateway ещё не слушает канал. Команды отправлю, но карточки могу пропустить.",
         )
 
-    profile_state = updateProfileState()
+    profile_state = updateProfileState(account=account, skip_actions=bonus_us)
     if profile_state is None:
         # При отсутствии ответа $tu не рискуем клеймом и используем базовый порог.
-        profile_state = {'can_claim': False, 'rt_ready': False, 'claim_minutes_left': 0}
+        profile_state = {
+            'account_key': account.key,
+            'can_claim': False,
+            'rt_ready': False,
+            'claim_minutes_left': 0,
+        }
         log_msg('WARN', "Использую базовый порог: состояние профиля недоступно.")
 
     claim_minutes_left = profile_state.get('claim_minutes_left', 0)
@@ -2945,20 +3306,36 @@ def _simpleRoll_body():
         return
 
     rolls_left = int(profile_state.get('rolls_left', 0) or 0)
-    if rolls_left == 0:
-        log_msg('ROLL', "Роллов нет (rolls_left=0). Сессия прокрутов пропущена.")
+    if rolls_left == 0 and not bonus_us:
+        log_msg('ROLL', f"Роллов нет ({account.label}, rolls_left=0). Сессия прокрутов пропущена.")
         if getattr(Vars, 'pokeRoll', False):
             _send_pokeslot()
-        return
+        return 0
 
-    begin_roll_session(profile_state, current_threshold, jackpot_threshold)
+    begin_roll_session(
+        profile_state,
+        current_threshold,
+        jackpot_threshold,
+        bonus_us=bonus_us,
+        roller_key=account.key,
+        stop_before=stop_before,
+    )
     rolls_done = 0
-    max_rolls = int(getattr(Vars, 'max_rolls_per_session', 150))
+    first_slash = None
+    if max_rolls is None:
+        max_rolls = int(getattr(Vars, 'max_rolls_per_session', 150))
+    max_rolls = max(1, int(max_rolls))
     try:
         while rolls_done < max_rolls:
+            if not wait_channel_quiet(
+                deadline=stop_before,
+                max_wait=None if stop_before else 20 * 60,
+            ):
+                log_msg('ROLL', 'Сессия остановлена: дальше ресет роллов.')
+                break
             if roll_session_limit_reached():
                 process_roll_claim_buffer(force=True)
-                if _try_use_rolls(profile_state, context='лимит в сессии'):
+                if not bonus_us and _try_use_rolls(profile_state, context='лимит в сессии'):
                     with _ROLL_LOCK:
                         _ROLL_SESSION['limit_reached'] = False
                     log_msg('ROLL', "Продолжаю сессию после $rolls.")
@@ -2968,8 +3345,10 @@ def _simpleRoll_body():
             process_roll_claim_buffer(force=False)
             action_pause()
             LAST_OUR_ROLL_TIME = time.time()
+            if first_slash is None:
+                first_slash = time.monotonic()
             try:
-                bot.triggerSlashCommand(
+                account.client.triggerSlashCommand(
                     botID, Vars.channelId, Vars.serverId, data=rollCommand,
                 )
             except Exception as error:
@@ -2983,7 +3362,13 @@ def _simpleRoll_body():
     finally:
         end_roll_session()
 
-    log_msg('ROLL', f"Сессия прокрутов завершена. Отправлено команд: {rolls_done}")
+    elapsed = (time.monotonic() - first_slash) if first_slash is not None else 0
+    log_msg(
+        'ROLL',
+        f"Сессия {account.label} завершена. Команд: {rolls_done}"
+        + (f", заняла {elapsed:.0f} с." if elapsed else "."),
+    )
 
-    if getattr(Vars, 'pokeRoll', False):
+    if getattr(Vars, 'pokeRoll', False) and not bonus_us:
         _send_pokeslot()
+    return elapsed if rolls_done else 0

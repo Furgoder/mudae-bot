@@ -7,6 +7,8 @@ services:
       - "5000:5000"
     environment:
       TZ: Asia/Almaty
+      MUDAE_DATA_DIR: /app/data
     volumes:
       - ./Vars.py:/app/Vars.py
+      - ./data:/app/data
     restart: unless-stopped

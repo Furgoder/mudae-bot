@@ -8,5 +8,7 @@ Vars.py
 *.db-wal
 *.db-shm
 claim_history.json
+logs/
+data/
 .idea/
 .vscode/

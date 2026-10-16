@@ -5,16 +5,32 @@ from datetime import datetime, timedelta
 
 import schedule
 
+import Accounts
 import Vars
 import Sniper  # noqa: F401 — регистрирует @bot.gateway.command
 import WebDashboard
-from Function import bot, simpleRoll, log_msg, human_sleep, set_next_roll_at
+from Function import (
+    _use_account,
+    bot,
+    simpleRoll,
+    use_stacked_rolls,
+    log_msg,
+    human_sleep,
+    set_next_roll_at,
+    wait_channel_quiet,
+)
 from Minigames import play_ouroharvest, play_ourochest, play_ouroquest
+
+_ROLL_JOBS = []
+_ROLL_LOCK = threading.Lock()
+_ROLL_SEQ = 0
+_ROLL_WAKE = threading.Event()
 
 
 next_oh_attempt = None
 next_oc_attempt = None
 next_oq_attempt = None
+_mg_next = {}
 
 _gateway_thread = None
 _gateway_lock = threading.Lock()
@@ -108,32 +124,207 @@ def _minigame_retry_delay(retry_after):
     return base + random.uniform(0, jitter)
 
 
-def scheduled_simple_roll():
-    """Роллы по расписанию со случайным сдвигом после :repeatMinute."""
-    if is_sleep_time():
+def _window_margin():
+    try:
+        return max(0.0, float(getattr(Vars, 'roll_window_margin_sec', 90)))
+    except (TypeError, ValueError):
+        return 90.0
+
+
+def _session_seconds(account):
+    saved = account.last_session_seconds
+    if saved and saved > 0:
+        return float(saved)
+    return 5 * 60
+
+
+def plan_roll_window(after=None, duration_sec=None, margin_sec=None):
+    """Случайный старт в [ресет, следующий ресет − длительность − запас].
+
+    Возвращает (start, finish_by, empty). finish_by — ресет, до которого сессия
+    должна закончиться. empty — окно короче сессии, старт ровно в ресет.
+    """
+    after = after or datetime.now()
+    minute = _repeat_minute()
+    duration_sec = max(1.0, float(duration_sec if duration_sec is not None else 5 * 60))
+    margin_sec = max(0.0, float(margin_sec if margin_sec is not None else _window_margin()))
+
+    def close_of(reset_at):
+        return reset_at + timedelta(hours=1) - timedelta(seconds=duration_sec + margin_sec)
+
+    reset_at = after.replace(second=0, microsecond=0, minute=minute)
+    if reset_at > after:
+        reset_at -= timedelta(hours=1)
+    close_at = close_of(reset_at)
+    empty = close_at <= reset_at
+    if empty or after > close_at:
+        reset_at = reset_at + timedelta(hours=1)
+        close_at = close_of(reset_at)
+        empty = close_at <= reset_at
+    finish_by = reset_at + timedelta(hours=1)
+    if empty:
+        return reset_at, finish_by, True
+    earliest = max(after, reset_at)
+    if earliest >= close_at:
+        reset_at = reset_at + timedelta(hours=1)
+        close_at = close_of(reset_at)
+        finish_by = reset_at + timedelta(hours=1)
+        if close_at <= reset_at:
+            return reset_at, finish_by, True
+        earliest = max(after, reset_at)
+    span = max(0.0, (close_at - earliest).total_seconds())
+    start = earliest + timedelta(seconds=random.uniform(0, span))
+    return start, finish_by, False
+
+
+def enqueue_roll(kind, account_key='main', *, not_before=None, finish_by=None, note='', rolls=None):
+    """Ставит крутку в общую очередь. Параллельных сессий нет."""
+    global _ROLL_SEQ
+    when = not_before
+    if when is None:
+        when = time.time()
+    elif hasattr(when, 'timestamp'):
+        when = float(when.timestamp())
+    else:
+        when = float(when)
+    finish = finish_by
+    if hasattr(finish, 'timestamp'):
+        finish = float(finish.timestamp())
+    with _ROLL_LOCK:
+        _ROLL_SEQ += 1
+        _ROLL_JOBS.append({
+            'seq': _ROLL_SEQ,
+            'kind': kind,
+            'account': account_key or 'main',
+            'not_before': when,
+            'finish_by': finish,
+            'note': note or '',
+            'rolls': int(rolls) if rolls else None,
+        })
+        _publish_queued_locked()
+    _ROLL_WAKE.set()
+
+
+def _publish_queued_locked():
+    scheduled = [job for job in _ROLL_JOBS if job['kind'] == 'scheduled']
+    if not scheduled:
+        return
+    nxt = min(scheduled, key=lambda job: job['not_before'])
+    account = Accounts.by_key(nxt['account'])
+    label = account.label if account else nxt['account']
+    publish_next_roll(
+        datetime.fromtimestamp(nxt['not_before']),
+        note=f"{label}" + (f", {nxt['note']}" if nxt['note'] else ''),
+    )
+    if account is not None:
+        account.next_roll_at = nxt['not_before']
+
+
+def _schedule_next(account, *, after=None, fresh_hour=True):
+    """fresh_hour: эта крутка уже была, следующее окно открывается на следующем ресете."""
+    moment = after or datetime.now()
+    if fresh_hour:
+        minute = _repeat_minute()
+        anchor = moment.replace(second=0, microsecond=0, minute=minute)
+        if anchor <= moment:
+            anchor += timedelta(hours=1)
+        moment = anchor
+    start, finish_by, empty = plan_roll_window(
+        moment,
+        _session_seconds(account),
+        _window_margin(),
+    )
+    note = 'ровно в ресет, сессия длиннее часа' if empty else 'окно после ресета'
+    if empty:
+        log_msg(
+            'WARN',
+            f"{account.label}: сессия длиннее часа, следующий старт ровно в "
+            f"{start.strftime('%H:%M')}.",
+        )
+    account.next_roll_at = start.timestamp()
+    enqueue_roll(
+        'scheduled',
+        account.key,
+        not_before=start,
+        finish_by=finish_by,
+        note=note,
+    )
+
+
+def _run_roll_job(job):
+    account = Accounts.by_key(job['account']) or Accounts.MAIN
+    kind = job['kind']
+    finish_by = job.get('finish_by')
+    stop_before = datetime.fromtimestamp(finish_by) if finish_by else None
+
+    if kind == 'scheduled' and is_sleep_time():
         wake = _sleep_wake_at()
-        set_next_roll_at(wake)
-        log_msg('SYS', f"Режим сна: бот отдыхает до {wake.strftime('%H:%M')}")
+        log_msg('SYS', f"Режим сна: {account.label} отдыхает до {wake.strftime('%H:%M')}")
+        _schedule_next(account, after=wake, fresh_hour=False)
         return
 
-    jitter_max = float(getattr(Vars, 'schedule_jitter_max', 90))
-    # Следующий час после этой сессии — чтобы UI уже во время роллов знал «далее»
-    upcoming = compute_next_roll_datetime(datetime.now() + timedelta(minutes=1))
+    if kind == 'scheduled' and finish_by and time.time() > finish_by:
+        log_msg('ROLL', f"{account.label}: окно закрылось, переношу на следующий ресет.", dim=True)
+        _schedule_next(account, after=datetime.now(), fresh_hour=False)
+        return
 
-    if getattr(Vars, 'humanize_enabled', True) and jitter_max > 0:
-        wait = random.uniform(0, jitter_max)
-        start_at = datetime.now() + timedelta(seconds=wait)
-        publish_next_roll(start_at, note=f'джиттер +{wait:.0f}с')
-        human_sleep(wait, wait, kind='schedule', log=False)  # уже залогировали выше
+    if kind in ('startup', 'force', 'us'):
+        quiet_deadline = stop_before
+        max_wait = None if quiet_deadline else 15 * 60
     else:
-        publish_next_roll(datetime.now(), note='старт по расписанию')
+        quiet_deadline = stop_before
+        max_wait = None
+    if not wait_channel_quiet(deadline=quiet_deadline, max_wait=max_wait):
+        log_msg('ROLL', f"{account.label}: эфир занят до конца окна, переношу крутку.")
+        if kind == 'scheduled':
+            _schedule_next(account, after=datetime.now(), fresh_hour=False)
+        return
+
     try:
-        set_next_roll_at(upcoming)  # во время сессии UI уже знает «далее»
-        simpleRoll()
+        if kind == 'us':
+            use_stacked_rolls(job.get('rolls') or 20, stop_before=stop_before)
+            return
+        simpleRoll(
+            account,
+            record_duration=True,
+            stop_before=stop_before,
+        )
     except Exception as error:
-        log_msg('WARN', f"Сессия роллов оборвалась (сеть/Discord): {error}")
-    finally:
-        publish_next_roll(upcoming, note='после сессии')
+        log_msg('WARN', f"Сессия {account.label} оборвалась (сеть/Discord): {error}")
+    if kind in ('startup', 'scheduled'):
+        _schedule_next(account, after=datetime.now())
+
+
+def roll_worker():
+    """Одна очередь на всех: старт сразу, дальше случайное окно, без наложений."""
+    log_msg('SYS', "Очередь роллов запущена.", dim=True)
+    Accounts.load_saved_durations()
+    if is_sleep_time():
+        wake = _sleep_wake_at()
+        log_msg('SYS', f"Режим сна на старте: первая крутка после {wake.strftime('%H:%M')}")
+        for account in Accounts.all_accounts():
+            _schedule_next(account, after=wake, fresh_hour=False)
+    else:
+        for account in Accounts.all_accounts():
+            enqueue_roll('startup', account.key, not_before=time.time(), note='старт')
+    while True:
+        _ROLL_WAKE.wait(timeout=0.5)
+        _ROLL_WAKE.clear()
+        with _ROLL_LOCK:
+            if not _ROLL_JOBS:
+                continue
+            _ROLL_JOBS.sort(key=lambda job: (job['not_before'], job['seq']))
+            nxt = _ROLL_JOBS[0]
+            if nxt['not_before'] > time.time():
+                continue
+            job = _ROLL_JOBS.pop(0)
+            _publish_queued_locked()
+        _run_roll_job(job)
+
+
+def scheduled_simple_roll():
+    """Совместимость: ручной вызов кладёт основного в очередь."""
+    enqueue_roll('force', 'main', note='ручной')
 
 
 def publish_minigame_cooldowns():
@@ -196,10 +387,67 @@ def apply_snipe_enabled(enabled):
         log_msg('SYS', "Снайпер: ВЫКЛ (Gateway остаётся для парсинга чата какеры).")
 
 
-def run_all_minigames():
-    """Запускает $oh/$oc/$oq с учётом индивидуального кулдауна каждой игры."""
-    global next_oh_attempt, next_oc_attempt, next_oq_attempt
+def _mg_bucket(account):
+    return _mg_next.setdefault(account.key, {'oh': None, 'oc': None, 'oq': None})
 
+
+def reset_minigame_timers():
+    """Сбрасывает кулдауны миниигр у всех аккаунтов (кнопка на панели)."""
+    global next_oh_attempt, next_oc_attempt, next_oq_attempt
+    _mg_next.clear()
+    next_oh_attempt = None
+    next_oc_attempt = None
+    next_oq_attempt = None
+
+
+def _sync_main_minigame_timers(account):
+    global next_oh_attempt, next_oc_attempt, next_oq_attempt
+    if not account.is_main:
+        return
+    bucket = _mg_bucket(account)
+    next_oh_attempt = bucket['oh']
+    next_oc_attempt = bucket['oc']
+    next_oq_attempt = bucket['oq']
+
+
+def _play_account_minigames(account, now):
+    """$oh/$oc/$oq одного аккаунта. Кулдаун у каждого свой."""
+    bucket = _mg_bucket(account)
+    games = (
+        ('oh', 'Ouroharvest ($oh)', play_ouroharvest),
+        ('oc', 'Ourochest ($oc)', play_ourochest),
+        ('oq', 'Ouroquest ($oq)', play_ouroquest),
+    )
+    launched = False
+    with _use_account(account):
+        for key, title, play in games:
+            due = bucket[key]
+            if due is not None and now < due:
+                continue
+            if launched:
+                human_sleep(
+                    float(getattr(Vars, 'minigame_gap_min', 1.5)),
+                    float(getattr(Vars, 'minigame_gap_max', 4.0)),
+                    kind='minigame',
+                )
+            log_msg('ROLL', f"{account.label}: запускаю {title}...", dim=True)
+            result = play()
+            retry_after = _minigame_retry_delay(result.get('retry_after', 300))
+            bucket[key] = now + timedelta(seconds=retry_after)
+            log_msg(
+                'SYS',
+                f"{account.label}: следующая проверка ${key} "
+                f"{bucket[key].strftime('%d.%m %H:%M')} "
+                f"({result.get('status', 'error')}, sleep+КД {retry_after:.0f}с).",
+                dim=True,
+            )
+            launched = True
+    _sync_main_minigame_timers(account)
+    return launched
+
+
+def run_all_minigames():
+    """Запускает $oh/$oc/$oq у основного и у каждого слейва."""
     if is_sleep_time():
         publish_minigame_cooldowns()
         return
@@ -209,57 +457,23 @@ def run_all_minigames():
         return
 
     now = datetime.now()
-    launched = False
-
-    if next_oh_attempt is None or now >= next_oh_attempt:
-        log_msg('ROLL', "Запускаю Ouroharvest ($oh) по таймеру...", dim=True)
-        result = play_ouroharvest()
-        retry_after = _minigame_retry_delay(result.get('retry_after', 300))
-        next_oh_attempt = now + timedelta(seconds=retry_after)
-        log_msg(
-            'SYS',
-            f"Следующая проверка $oh: {next_oh_attempt.strftime('%d.%m %H:%M')} "
-            f"({result.get('status', 'error')}, sleep+КД {retry_after:.0f}с).",
-            dim=True,
-        )
-        launched = True
-
-    if next_oc_attempt is None or now >= next_oc_attempt:
-        if launched:
+    played = False
+    for account in Accounts.all_accounts():
+        bucket = _mg_bucket(account)
+        due = any(bucket[key] is None or now >= bucket[key] for key in ('oh', 'oc', 'oq'))
+        if not due:
+            continue
+        if played:
             human_sleep(
                 float(getattr(Vars, 'minigame_gap_min', 1.5)),
                 float(getattr(Vars, 'minigame_gap_max', 4.0)),
                 kind='minigame',
             )
-        log_msg('ROLL', "Запускаю Ourochest ($oc) по таймеру...", dim=True)
-        result = play_ourochest()
-        retry_after = _minigame_retry_delay(result.get('retry_after', 300))
-        next_oc_attempt = now + timedelta(seconds=retry_after)
-        log_msg(
-            'SYS',
-            f"Следующая проверка $oc: {next_oc_attempt.strftime('%d.%m %H:%M')} "
-            f"({result.get('status', 'error')}, sleep+КД {retry_after:.0f}с).",
-            dim=True,
-        )
-        launched = True
-
-    if next_oq_attempt is None or now >= next_oq_attempt:
-        if launched:
-            human_sleep(
-                float(getattr(Vars, 'minigame_gap_min', 1.5)),
-                float(getattr(Vars, 'minigame_gap_max', 4.0)),
-                kind='minigame',
-            )
-        log_msg('ROLL', "Запускаю Ouroquest ($oq) по таймеру...", dim=True)
-        result = play_ouroquest()
-        retry_after = _minigame_retry_delay(result.get('retry_after', 300))
-        next_oq_attempt = now + timedelta(seconds=retry_after)
-        log_msg(
-            'SYS',
-            f"Следующая проверка $oq: {next_oq_attempt.strftime('%d.%m %H:%M')} "
-            f"({result.get('status', 'error')}, sleep+КД {retry_after:.0f}с).",
-            dim=True,
-        )
+        try:
+            _play_account_minigames(account, now)
+        except Exception as error:
+            log_msg('WARN', f"{account.label}: миниигры: {error}")
+        played = True
 
     publish_minigame_cooldowns()
 
@@ -288,29 +502,20 @@ def start_bot():
 
     # 1. Индикация запуска
     log_msg('SYS', "Бот успешно запущен!")
-    jitter_max = float(getattr(Vars, 'schedule_jitter_max', 90))
-    if getattr(Vars, 'humanize_enabled', True) and jitter_max > 0:
-        log_msg(
-            'SYS',
-            f"Расписание: роллы каждый час в XX:{Vars.repeatMinute} "
-            f"(+0…{int(jitter_max)}с джиттер)",
-        )
-    else:
-        log_msg('SYS', f"Расписание: роллы каждый час в XX:{Vars.repeatMinute}")
+    names = ', '.join(account.label for account in Accounts.all_accounts())
+    log_msg(
+        'SYS',
+        f"Рой: {names}. Ресет роллов в XX:{_repeat_minute():02d}, "
+        f"старт случайный после ресета.",
+    )
 
     # 2. Gateway сразу — парсер какеры ($k / $ku) не зависит от снайпа
     start_gateway()
 
-    # 3. Моментальный запуск для отладки
-    log_msg('ROLL', "Выполняю тестовый стартовый прокрут...", dim=True)
-    try:
-        simpleRoll()
-    finally:
-        publish_next_roll(note='после старта')
+    # 3. Очередь роллов: первый проход сразу, дальше окно после ресета
+    threading.Thread(target=roll_worker, daemon=True, name='RollQueue').start()
 
-    # 4. Настройка планировщика
-    timeString = f":{Vars.repeatMinute}"
-    schedule.every().hour.at(timeString).do(scheduled_simple_roll)
+    # 4. Миниигры по-прежнему раз в минуту
     schedule.every(1).minutes.do(run_all_minigames)
 
     # 5. Планировщик в фоне

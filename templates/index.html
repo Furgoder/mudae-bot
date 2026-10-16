@@ -271,6 +271,8 @@
             <p id="cd-oq" class="font-display text-xl font-bold text-accent-amber tabular-nums">Готово</p>
           </div>
         </div>
+        <p class="text-[10px] uppercase tracking-wider text-slate-500 mt-4 mb-2">Рой</p>
+        <div id="swarm-list" class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3"></div>
       </section>
 
       <section class="rounded-2xl border border-white/5 bg-ink-900/80 backdrop-blur px-6 py-5">
@@ -351,6 +353,15 @@
             class="rounded-xl border border-accent-sky/30 bg-accent-sky/10 hover:bg-accent-sky/20 px-5 py-3 text-sm font-semibold text-accent-sky transition">
             Принудительный Прокрут
           </button>
+          <div class="flex items-center gap-2 rounded-xl border border-accent-mint/30 bg-accent-mint/10 px-3 py-2">
+            <input id="us-roll-count" type="number" min="20" step="20" value="20"
+              class="w-20 rounded-lg border border-white/10 bg-black/30 px-2 py-1.5 text-sm text-white" />
+            <span class="text-xs text-slate-400">роллов</span>
+            <button id="btn-us-rolls" type="button"
+              class="px-3 py-1.5 text-sm font-semibold text-accent-mint transition hover:text-white">
+              $us 20
+            </button>
+          </div>
           <button id="btn-force-minigames" type="button"
             class="rounded-xl border border-accent-amber/30 bg-accent-amber/10 hover:bg-accent-amber/20 px-5 py-3 text-sm font-semibold text-accent-amber transition">
             Запуск Миниигр
@@ -560,6 +571,38 @@
         `Буфер пуст — ждём свободную карту с ценой ≥ ${currentThresholdLabel}`;
     }
 
+    function formatDuration(seconds) {
+      const value = Number(seconds);
+      if (!Number.isFinite(value) || value <= 0) return '—';
+      const total = Math.round(value);
+      return `${Math.floor(total / 60)}м ${total % 60}с`;
+    }
+
+    function renderSwarm(rows) {
+      const root = document.getElementById('swarm-list');
+      if (!root) return;
+      const list = Array.isArray(rows) ? rows : [];
+      if (!list.length) {
+        root.innerHTML = '';
+        return;
+      }
+      root.innerHTML = list.map((row) => {
+        const claim = row.can_claim ? 'клейм есть' : 'клейм в откате';
+        const kakera = row.kakera_ready ? 'реакция готова' : `реакция ${formatSecondsLeft(row.kakera_seconds || 0)}`;
+        const next = row.next_roll_at ? formatClock(row.next_roll_at) : '—';
+        const lasted = formatDuration(row.last_session_seconds);
+        const role = row.role === 'main' ? 'основной' : 'слейв';
+        return `
+          <div class="rounded-xl bg-ink-800/80 px-4 py-3 border border-white/5">
+            <p class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">${escapeHtml(role)}</p>
+            <p class="font-display text-lg font-bold text-white truncate">${escapeHtml(row.label || row.key || '')}</p>
+            <p class="text-[11px] text-slate-400 mt-1">роллов: ${escapeHtml(String(row.rolls_left ?? '—'))} · ${escapeHtml(claim)}</p>
+            <p class="text-[11px] text-slate-400">${escapeHtml(kakera)}</p>
+            <p class="text-[11px] text-slate-500 mt-1">далее ${escapeHtml(next)} · прошлая ${escapeHtml(lasted)}</p>
+          </div>`;
+      }).join('');
+    }
+
     function applyProfile(data) {
       if (!data) return;
       el.cdRolls.textContent = formatMinutes(data.rolls_reset_minutes);
@@ -698,6 +741,16 @@
                   <span class="slider"></span>
                 </span>
               </label>`;
+          } else if (type === 'literal') {
+            field.classList.add('md:col-span-2');
+            const shown = typeof value === 'string' ? value : JSON.stringify(value ?? [], null, 2);
+            field.innerHTML = `
+              <label class="block">
+                <span class="text-sm text-white font-semibold">${escapeHtml(key)}</span>
+                <span class="block text-[10px] text-slate-500 mb-1">JSON-список. Токены слейвов, например [{"token":"...","username":""}]</span>
+                <textarea data-var-key="${escapeHtml(key)}" data-var-type="literal" rows="4"
+                  class="mt-1 w-full rounded-lg bg-ink-950/80 border border-white/10 px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-accent-mint/40">${escapeHtml(shown)}</textarea>
+              </label>`;
           } else if (type === 'list') {
             field.classList.add('md:col-span-2');
             field.innerHTML = `
@@ -742,6 +795,8 @@
         } else if (type === 'number') {
           const n = Number(input.value);
           settings[key] = Number.isFinite(n) ? n : input.value;
+        } else if (type === 'literal') {
+          settings[key] = String(input.value ?? '[]');
         } else if (type === 'list') {
           const text = String(input.value || '').trim();
           if (!text) {
@@ -945,6 +1000,7 @@
     });
 
     socket.on('profile_update', applyProfile);
+    socket.on('swarm_update', renderSwarm);
     socket.on('minigames_update', applyMinigames);
     socket.on('settings_update', applySettings);
     socket.on('vars_update', renderVarsForm);
@@ -1039,8 +1095,20 @@
       socket.emit('force_tu_update', {});
     });
     document.getElementById('btn-force-roll').addEventListener('click', () => {
-      el.actionHint.textContent = 'Запускаю прокрут…';
+      el.actionHint.textContent = 'Ставлю прокрут в очередь…';
       socket.emit('force_roll', {});
+    });
+    function usRollCount() {
+      const raw = Number(document.getElementById('us-roll-count').value);
+      const snapped = Math.max(20, Math.ceil((Number.isFinite(raw) ? raw : 20) / 20) * 20);
+      return Math.min(400, snapped);
+    }
+    document.getElementById('btn-us-rolls').addEventListener('click', () => {
+      const rolls = usRollCount();
+      document.getElementById('us-roll-count').value = rolls;
+      const times = rolls / 20;
+      el.actionHint.textContent = `Ставлю ${times}× $us 20 (${rolls} роллов)…`;
+      socket.emit('use_us_rolls', { rolls });
     });
     document.getElementById('btn-force-minigames').addEventListener('click', () => {
       el.actionHint.textContent = 'Запускаю миниигры…';
