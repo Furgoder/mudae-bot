@@ -162,12 +162,18 @@ def _set_rolls_reset_cooldown(minutes, *, reason='', account=None):
     account.rolls_reset_used_until = time.time() + minutes * 60
     if account.is_main:
         ROLLS_RESET_USED_UNTIL = account.rolls_reset_used_until
+    until = time.strftime('%H:%M:%S', time.localtime(account.rolls_reset_used_until))
+    if reason == 'успешный сброс':
+        log_msg(
+            'ROLL',
+            f"$rolls сработал ({account.label}). Следующий сброс через {minutes} мин (до {until}).",
+        )
+        return
     suffix = f" ({reason})" if reason else ''
     log_msg(
         'ROLL',
         f"$rolls уже использован в этом интервале{suffix} ({account.label}). "
-        f"Следующий через {minutes} мин "
-        f"(до {time.strftime('%H:%M:%S', time.localtime(account.rolls_reset_used_until))}).",
+        f"Следующий через {minutes} мин (до {until}).",
     )
 
 
@@ -2982,12 +2988,22 @@ def click_card_loot(message, *, log_prefix='Найдена кнопка каке
             _LOOT_DIRTY.discard(mid)
 
 
+def _is_sphere_grid(message):
+    """Сетка $oh/$oc/$oq: 5 рядов по 5 кнопок. Это не карточка персонажа."""
+    rows = message.get('components') or []
+    if len(rows) != 5:
+        return False
+    return all(isinstance(row, dict) and len(row.get('components') or []) == 5 for row in rows)
+
+
 def on_mudae_gateway_message(message, *, is_update=False):
     """Своя карточка с Gateway: клейм, какера, сфера. Чужие не трогает.
 
     Возвращает 'ours' / 'other' / 'unknown'.
     """
     if not isinstance(message, dict):
+        return 'unknown'
+    if _is_sphere_grid(message):
         return 'unknown'
     _learn_emoji_shortcodes(_message_text_blob(message))
 

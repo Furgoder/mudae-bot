@@ -25,6 +25,9 @@ _ROLL_JOBS = []
 _ROLL_LOCK = threading.Lock()
 _ROLL_SEQ = 0
 _ROLL_WAKE = threading.Event()
+# Роллы и миниигры делят один канал. Пока замок занят, вторая активность ждёт.
+_CHANNEL_LOCK = threading.Lock()
+_mg_deferred = False
 
 
 next_oh_attempt = None
@@ -268,6 +271,16 @@ def _run_roll_job(job):
         _schedule_next(account, after=datetime.now(), fresh_hour=False)
         return
 
+    if not _CHANNEL_LOCK.acquire(blocking=False):
+        log_msg('ROLL', f"{account.label}: жду, пока в канале закончатся миниигры.", dim=True)
+        _CHANNEL_LOCK.acquire()
+    try:
+        _run_roll_job_locked(job, account, kind, finish_by, stop_before)
+    finally:
+        _CHANNEL_LOCK.release()
+
+
+def _run_roll_job_locked(job, account, kind, finish_by, stop_before):
     if kind in ('startup', 'force', 'us'):
         quiet_deadline = stop_before
         max_wait = None if quiet_deadline else 15 * 60
@@ -448,6 +461,7 @@ def _play_account_minigames(account, now):
 
 def run_all_minigames():
     """Запускает $oh/$oc/$oq у основного и у каждого слейва."""
+    global _mg_deferred
     if is_sleep_time():
         publish_minigame_cooldowns()
         return
@@ -456,6 +470,20 @@ def run_all_minigames():
         publish_minigame_cooldowns()
         return
 
+    if not _CHANNEL_LOCK.acquire(blocking=False):
+        if not _mg_deferred:
+            log_msg('SYS', 'Миниигры подождут: в канале идёт прокрут.', dim=True)
+            _mg_deferred = True
+        publish_minigame_cooldowns()
+        return
+    _mg_deferred = False
+    try:
+        _run_minigames_locked()
+    finally:
+        _CHANNEL_LOCK.release()
+
+
+def _run_minigames_locked():
     now = datetime.now()
     played = False
     for account in Accounts.all_accounts():
